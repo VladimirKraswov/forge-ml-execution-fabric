@@ -789,18 +789,15 @@ function buildTrainerJobPayload({
   runtimeProfileId,
   jobId,
   runtimeImage,
-  datasetBaseUrl, // not used for HF dataset
+  datasetBaseUrl,
   hfRepo,
   logicalBaseModelId,
 }) {
-  // Construct URLs for the HF dataset files (assuming they exist at these paths)
-  const trainUrl = `https://huggingface.co/datasets/${HF_DATASET}/resolve/main/train.json`;
-  const valUrl = `https://huggingface.co/datasets/${HF_DATASET}/resolve/main/val.json`;
-  const evalUrl = `https://huggingface.co/datasets/${HF_DATASET}/resolve/main/eval.jsonl`;
+  // Используем URL локального fixture сервера
+  const trainUrl = `${datasetBaseUrl}/datasets/train.json`;
+  const valUrl = `${datasetBaseUrl}/datasets/val.json`;
+  const evalUrl = `${datasetBaseUrl}/datasets/eval.jsonl`;
 
-  // Note: dataset.source = 'url' because we're fetching from URL.
-  // The dataset may be in instruction_output format. We assume the HF dataset has
-  // 'input' and 'output' fields. Adjust if necessary.
   const model = {
     source: 'local',
     local_path: '/app',
@@ -859,9 +856,7 @@ function buildTrainerJobPayload({
       job_id: jobId,
       job_name: `trainer-e2e-${jobId}`,
       mode: 'remote',
-
       model,
-
       dataset: {
         source: 'url',
         train_url: trainUrl,
@@ -870,9 +865,7 @@ function buildTrainerJobPayload({
         input_field: 'input',
         output_field: 'output',
       },
-
       training,
-
       lora: {
         r: 8,
         lora_alpha: 16,
@@ -882,13 +875,10 @@ function buildTrainerJobPayload({
         random_state: 3407,
         target_modules: ['q_proj', 'v_proj'],
       },
-
       outputs: {
         base_dir: `/output/${jobId}`,
       },
-
       postprocess,
-
       evaluation: {
         enabled: true,
         target: 'merged',
@@ -898,13 +888,11 @@ function buildTrainerJobPayload({
         do_sample: false,
         dataset: evaluationDataset,
       },
-
       upload: {
         enabled: true,
         target: 'url',
         timeout_sec: 300,
       },
-
       huggingface: {
         enabled: true,
         push_lora: false,
@@ -914,18 +902,10 @@ function buildTrainerJobPayload({
         private: false,
         commit_message: `trainer-runtime e2e ${jobId}`,
       },
-
-      // All steps enabled
       pipeline: {
         prepare_assets: { enabled: true },
-        training: {
-          enabled: true,
-          ...training,
-        },
-        merge: {
-          enabled: true,
-          ...postprocess,
-        },
+        training: { enabled: true, ...training },
+        merge: { enabled: true, ...postprocess },
         evaluation: {
           enabled: true,
           target: 'merged',
@@ -944,14 +924,9 @@ function buildTrainerJobPayload({
           private: false,
           commit_message: `trainer-runtime e2e ${jobId}`,
         },
-        upload: {
-          enabled: true,
-          target: 'url',
-          timeout_sec: 300,
-        },
-      }
+        upload: { enabled: true, target: 'url', timeout_sec: 300 },
+      },
     },
-
     executor: {
       image: runtimeImage,
       gpus: 'all',
