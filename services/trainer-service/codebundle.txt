@@ -1,0 +1,4636 @@
+=== CODE BUNDLE ===
+root: /Volumes/Extend/work/llm-lab/services/trainer-service
+ignore: .codebun)dleignore
+generated: 2026-03-22T13:48:11.070Z
+
+
+
+path: /.env.local.example
+----------------------------------------
+CONFIG_SOURCE=local
+CONFIG_REF=/configs/job.local.json
+HF_TOKEN=hf_xxx
+
+
+path: /.env.remote.example
+----------------------------------------
+CONFIG_SOURCE=remote
+CONFIG_REF=http://192.168.31.32:8010/files/job.remote.json
+HF_TOKEN=hf_xxx
+
+
+path: /app/archiver.py
+----------------------------------------
+from __future__ import annotations
+
+import logging
+import tarfile
+from pathlib import Path
+from typing import Dict, Iterable, Optional
+
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+logger = logging.getLogger(__name__)
+
+
+def build_retry_session(total_retries: int = 3) -> requests.Session:
+    retry = Retry(
+        total=total_retries,
+        connect=total_retries,
+        read=total_retries,
+        status=total_retries,
+        other=total_retries,
+        backoff_factor=1.0,
+        allowed_methods=None,
+        status_forcelist=[408, 425, 429, 500, 502, 503, 504],
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    session = requests.Session()
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    return session
+
+
+class Archiver:
+    def __init__(self, session: Optional[requests.Session] = None, retries: int = 3):
+        self.session = session or build_retry_session(retries)
+
+    def make_archive(
+        self,
+        source_dir: str,
+        output_filename: str,
+        exclude_names: Optional[Iterable[str]] = None,
+    ) -> str:
+        source_path = Path(source_dir).resolve()
+        output_path = Path(output_filename).resolve()
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        excluded = set(exclude_names or set())
+        excluded.update({"downloads", "__pycache__"})
+
+        if output_path.parent == source_path:
+            excluded.add(output_path.name)
+
+        print(f"==> creating archive {output_path} from {source_path}")
+        with tarfile.open(output_path, "w:gz", compresslevel=1) as tar:
+            for item in source_path.iterdir():
+                if item.name in excluded:
+                    continue
+                if item.is_file() and item.name.endswith((".tar", ".tar.gz", ".tgz")):
+                    continue
+                tar.add(item, arcname=item.name)
+
+        return str(output_path)
+
+    def upload_archive(
+        self,
+        archive_path: str,
+        upload_url: str,
+        headers: Optional[Dict[str, str]] = None,
+        form_data: Optional[Dict[str, str]] = None,
+        timeout_sec: int = 120,
+    ) -> None:
+        print(f"==> uploading archive to {upload_url}")
+        with open(archive_path, "rb") as f:
+            files = {"file": (Path(archive_path).name, f, "application/gzip")}
+            response = self.session.post(
+                upload_url,
+                files=files,
+                data=form_data or {},
+                headers=headers or {},
+                timeout=(10, timeout_sec),
+            )
+            response.raise_for_status()
+        print("==> upload successful")
+
+
+path: /app/artifact_uploader.py
+----------------------------------------
+from __future__ import annotations
+
+import logging
+import re
+from pathlib import Path
+from typing import Any, Callable, Dict, Optional
+
+from huggingface_hub import HfApi
+
+from archiver import Archiver
+from hf_utils import build_hf_api, get_hf_token
+from schemas import JobConfig
+
+logger = logging.getLogger(__name__)
+
+
+class ArtifactUploader:
+    def __init__(self, cfg: JobConfig):
+        self.cfg = cfg
+        self.archiver = Archiver()
+        self.session = self.archiver.session
+
+    def _headers(self) -> Dict[str, str]:
+        headers: Dict[str, str] = {}
+        if self.cfg.upload.auth.headers:
+            headers.update(self.cfg.upload.auth.headers)
+        if self.cfg.upload.auth.bearer_token:
+            headers["Authorization"] = f"Bearer {self.cfg.upload.auth.bearer_token}"
+        return headers
+
+    @staticmethod
+    def _is_probably_local_model_ref(value: str) -> bool:
+        value = str(value or "").strip()
+        if not value:
+            return False
+        if value.startswith("/"):
+            return True
+        if value.startswith("./") or value.startswith("../"):
+            return True
+        if value.startswith("\\") or "\\" in value:
+            return True
+        if len(value) > 1 and value[1] == ":":
+            return True
+        return False
+
+    def _resolve_hf_base_model_id(
+        self,
+        training_result: Optional[Dict[str, Any]] = None,
+    ) -> Optional[str]:
+        candidates = []
+
+        if training_result:
+            candidates.extend(
+                [
+                    training_result.get("base_model_id"),
+                    training_result.get("base_model_name_or_path"),
+                    training_result.get("base_model"),
+                ]
+            )
+            summary = training_result.get("summary") or {}
+            if isinstance(summary, dict):
+                candidates.extend(
+                    [
+                        summary.get("base_model_id"),
+                        summary.get("base_model_name_or_path"),
+                        summary.get("base_model"),
+                    ]
+                )
+
+        candidates.extend(
+            [
+                self.cfg.model.logical_base_model_id,
+                self.cfg.model.repo_id,
+                self.cfg.model.base_model_name_or_path,
+                self.cfg.model.base_model,
+            ]
+        )
+
+        for candidate in candidates:
+            if not isinstance(candidate, str):
+                continue
+            value = candidate.strip()
+            if not value:
+                continue
+            if self._is_probably_local_model_ref(value):
+                continue
+            return value
+
+        return None
+
+    def _rewrite_readme_frontmatter_base_model(
+        self,
+        readme_path: Path,
+        base_model_id: Optional[str],
+    ) -> bool:
+        if not readme_path.exists():
+            return False
+
+        original = readme_path.read_text(encoding="utf-8")
+        newline = "\r\n" if "\r\n" in original else "\n"
+        had_trailing_newline = original.endswith("\n") or original.endswith("\r")
+
+        def finalize(parts: list[str]) -> str:
+            text = newline.join(parts)
+            if had_trailing_newline and not text.endswith(newline):
+                text += newline
+            return text
+
+        lines = original.splitlines()
+
+        if lines and lines[0].strip() == "---":
+            frontmatter_end = None
+            for idx in range(1, len(lines)):
+                if lines[idx].strip() == "---":
+                    frontmatter_end = idx
+                    break
+
+            if frontmatter_end is not None:
+                header_lines = lines[1:frontmatter_end]
+                body_lines = lines[frontmatter_end + 1 :]
+
+                updated_header: list[str] = []
+                found_base_model = False
+                changed = False
+
+                for line in header_lines:
+                    if re.match(r"^\s*base_model\s*:", line):
+                        found_base_model = True
+                        if base_model_id:
+                            replacement = f"base_model: {base_model_id}"
+                            updated_header.append(replacement)
+                            if line != replacement:
+                                changed = True
+                        else:
+                            changed = True
+                        continue
+                    updated_header.append(line)
+
+                if base_model_id and not found_base_model:
+                    updated_header.append(f"base_model: {base_model_id}")
+                    changed = True
+
+                if not changed:
+                    return False
+
+                updated = finalize(["---", *updated_header, "---", *body_lines])
+                readme_path.write_text(updated, encoding="utf-8")
+                return True
+
+        if not base_model_id:
+            return False
+
+        updated = f"---{newline}base_model: {base_model_id}{newline}---{newline}{newline}{original}"
+        readme_path.write_text(updated, encoding="utf-8")
+        return True
+
+    def _normalize_model_card_metadata(
+        self,
+        folder_path: str,
+        training_result: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        repo_dir = Path(folder_path)
+        readme_path = repo_dir / "README.md"
+        if not readme_path.exists():
+            return
+
+        base_model_id = self._resolve_hf_base_model_id(training_result)
+        changed = self._rewrite_readme_frontmatter_base_model(readme_path, base_model_id)
+        if changed:
+            logger.info(
+                "==> normalized README.md metadata in %s (base_model=%s)",
+                readme_path,
+                base_model_id or "<removed>",
+            )
+
+    def _upload_file(self, file_path: str, upload_url: str, artifact_type: str) -> Dict[str, str]:
+        path = Path(file_path)
+        if not upload_url or not path.exists():
+            return {}
+
+        with path.open("rb") as f:
+            files = {"file": (path.name, f, "application/octet-stream")}
+            data = {
+                "job_id": self.cfg.job_id or self.cfg.job_name,
+                "job_name": self.cfg.job_name,
+                "artifact_type": artifact_type,
+            }
+            response = self.session.post(
+                upload_url,
+                files=files,
+                data=data,
+                headers=self._headers(),
+                timeout=(10, self.cfg.upload.timeout_sec),
+            )
+            response.raise_for_status()
+
+        return {"url": upload_url, "path": str(path)}
+
+    def _archive_and_upload_dir(
+        self,
+        dir_path: str,
+        upload_url: str,
+        archive_name: str,
+        artifact_type: str,
+    ) -> Dict[str, str]:
+        path = Path(dir_path)
+        if not upload_url or not path.exists():
+            return {}
+
+        archive_path = Path(self.cfg.outputs.base_dir) / archive_name
+        self.archiver.make_archive(
+            str(path),
+            str(archive_path),
+            exclude_names={"downloads", "__pycache__"},
+        )
+        self.archiver.upload_archive(
+            str(archive_path),
+            upload_url,
+            headers=self._headers(),
+            form_data={
+                "job_id": self.cfg.job_id or self.cfg.job_name,
+                "job_name": self.cfg.job_name,
+                "artifact_type": artifact_type,
+            },
+            timeout_sec=self.cfg.upload.timeout_sec,
+        )
+        return {"url": upload_url, "archive_path": str(archive_path)}
+
+    def _safe_upload(
+        self,
+        key: str,
+        operation: Callable[[], Dict[str, str]],
+        uploaded: Dict[str, Dict[str, str]],
+        errors: Dict[str, str],
+    ) -> None:
+        try:
+            result = operation()
+            if result:
+                uploaded[key] = result
+        except Exception as exc:
+            logger.exception("upload step failed: %s", key)
+            errors[key] = str(exc)
+
+    def upload_non_summary_artifacts(
+        self,
+        log_file: str,
+        effective_config_path: str,
+        training_result: Dict,
+        eval_result: Optional[Dict] = None,
+    ) -> tuple[Dict[str, Dict[str, str]], Dict[str, str]]:
+        uploaded: Dict[str, Dict[str, str]] = {}
+        errors: Dict[str, str] = {}
+
+        if self.cfg.upload.enabled and self.cfg.upload.target == "url":
+            targets = self.cfg.upload.url_targets
+
+            if targets.logs_url:
+                self._safe_upload(
+                    "logs",
+                    lambda: self._upload_file(log_file, targets.logs_url, "logs"),
+                    uploaded,
+                    errors,
+                )
+
+            if targets.effective_config_url:
+                self._safe_upload(
+                    "effective_config",
+                    lambda: self._upload_file(
+                        effective_config_path,
+                        targets.effective_config_url,
+                        "config",
+                    ),
+                    uploaded,
+                    errors,
+                )
+
+            metrics_path = training_result.get("metrics_path")
+            if targets.train_metrics_url and metrics_path:
+                self._safe_upload(
+                    "train_metrics",
+                    lambda: self._upload_file(
+                        metrics_path,
+                        targets.train_metrics_url,
+                        "train_metrics",
+                    ),
+                    uploaded,
+                    errors,
+                )
+
+            history_path = training_result.get("history_path")
+            if targets.train_history_url and history_path:
+                self._safe_upload(
+                    "train_history",
+                    lambda: self._upload_file(
+                        history_path,
+                        targets.train_history_url,
+                        "train_history",
+                    ),
+                    uploaded,
+                    errors,
+                )
+
+            lora_dir = training_result.get("lora_dir")
+            if targets.lora_archive_url and lora_dir:
+                self._safe_upload(
+                    "lora_archive",
+                    lambda: self._archive_and_upload_dir(
+                        lora_dir,
+                        targets.lora_archive_url,
+                        f"{self.cfg.job_name}.lora.tar.gz",
+                        "lora_archive",
+                    ),
+                    uploaded,
+                    errors,
+                )
+
+            merged_dir = training_result.get("merged_dir")
+            if targets.merged_archive_url and merged_dir and Path(merged_dir).exists():
+                self._safe_upload(
+                    "merged_archive",
+                    lambda: self._archive_and_upload_dir(
+                        merged_dir,
+                        targets.merged_archive_url,
+                        f"{self.cfg.job_name}.merged.tar.gz",
+                        "merged_archive",
+                    ),
+                    uploaded,
+                    errors,
+                )
+
+            if targets.full_archive_url:
+                self._safe_upload(
+                    "full_archive",
+                    lambda: self._archive_and_upload_dir(
+                        self.cfg.outputs.base_dir,
+                        targets.full_archive_url,
+                        f"{self.cfg.job_name}.full.tar.gz",
+                        "full_archive",
+                    ),
+                    uploaded,
+                    errors,
+                )
+
+            if eval_result:
+                if targets.eval_summary_url and eval_result.get("summary_json_path"):
+                    self._safe_upload(
+                        "eval_summary",
+                        lambda: self._upload_file(
+                            eval_result["summary_json_path"],
+                            targets.eval_summary_url,
+                            "evaluation_summary",
+                        ),
+                        uploaded,
+                        errors,
+                    )
+
+                if targets.eval_details_url and eval_result.get("detailed_csv_path"):
+                    self._safe_upload(
+                        "eval_details",
+                        lambda: self._upload_file(
+                            eval_result["detailed_csv_path"],
+                            targets.eval_details_url,
+                            "evaluation_details",
+                        ),
+                        uploaded,
+                        errors,
+                    )
+
+        return uploaded, errors
+
+    def upload_summary(self, summary_path: str) -> Dict[str, Dict[str, str]]:
+        uploaded: Dict[str, Dict[str, str]] = {}
+        if (
+            self.cfg.upload.enabled
+            and self.cfg.upload.target == "url"
+            and self.cfg.upload.url_targets.summary_url
+        ):
+            uploaded["summary"] = self._upload_file(
+                summary_path,
+                self.cfg.upload.url_targets.summary_url,
+                "job_summary",
+            )
+        return uploaded
+
+    def _hf_plan(self) -> Dict[str, Any]:
+        lora_repo = self.cfg.huggingface.repo_id_lora or self.cfg.upload.repo_id_lora
+        merged_repo = self.cfg.huggingface.repo_id_merged or self.cfg.upload.repo_id_merged
+        metadata_repo = (
+            self.cfg.huggingface.repo_id_metadata
+            or self.cfg.upload.repo_id_metadata
+            or lora_repo
+            or merged_repo
+        )
+
+        request_lora = bool(
+            lora_repo and (
+                self.cfg.huggingface.push_lora
+                or self.cfg.upload.target == "huggingface"
+            )
+        )
+        request_merged = bool(
+            merged_repo and (
+                self.cfg.huggingface.push_merged
+                or self.cfg.upload.target == "huggingface"
+            )
+        )
+        request_metadata = bool(
+            metadata_repo and (
+                self.cfg.huggingface.enabled
+                or self.cfg.upload.target == "huggingface"
+                or request_lora
+                or request_merged
+            )
+        )
+
+        private = (
+            self.cfg.huggingface.private
+            if self.cfg.huggingface.enabled
+            else self.cfg.upload.private
+        )
+        commit_message = (
+            self.cfg.huggingface.commit_message
+            if self.cfg.huggingface.enabled
+            else self.cfg.upload.commit_message
+        )
+        revision = self.cfg.huggingface.revision
+
+        return {
+            "request_lora": request_lora,
+            "request_merged": request_merged,
+            "request_metadata": request_metadata,
+            "lora_repo": lora_repo,
+            "merged_repo": merged_repo,
+            "metadata_repo": metadata_repo,
+            "private": private,
+            "commit_message": commit_message,
+            "revision": revision,
+        }
+
+    def ensure_hf_ready(self) -> Dict[str, Any]:
+        plan = self._hf_plan()
+
+        if not plan["request_lora"] and not plan["request_merged"] and not plan["request_metadata"]:
+            return plan
+
+        if not get_hf_token():
+            raise RuntimeError("Hugging Face upload is requested, but HF_TOKEN is missing")
+
+        if plan["request_lora"] and not plan["lora_repo"]:
+            raise RuntimeError("LoRA upload is requested, but repo_id_lora is missing")
+
+        if plan["request_merged"] and not plan["merged_repo"]:
+            raise RuntimeError("Merged upload is requested, but repo_id_merged is missing")
+
+        if plan["request_metadata"] and not plan["metadata_repo"]:
+            raise RuntimeError("Metadata upload is requested, but metadata repo cannot be resolved")
+
+        api = build_hf_api()
+        whoami = api.whoami()
+        logger.info("==> Hugging Face upload ready for account: %s", whoami.get("name") or "unknown")
+        return plan
+
+    def upload_to_huggingface(self, training_result: Dict) -> Dict[str, Dict[str, str]]:
+        uploaded: Dict[str, Dict[str, str]] = {}
+        plan = self._hf_plan()
+
+        if not plan["request_lora"] and not plan["request_merged"]:
+            return uploaded
+
+        api = build_hf_api()
+
+        if plan["request_lora"]:
+            lora_dir = training_result.get("lora_dir")
+            if not lora_dir or not Path(lora_dir).exists():
+                raise RuntimeError("LoRA upload requested but lora_dir is missing")
+
+            self._normalize_model_card_metadata(lora_dir, training_result)
+
+            api.create_repo(
+                repo_id=plan["lora_repo"],
+                repo_type="model",
+                private=plan["private"],
+                exist_ok=True,
+            )
+            api.upload_folder(
+                repo_id=plan["lora_repo"],
+                repo_type="model",
+                folder_path=lora_dir,
+                commit_message=plan["commit_message"],
+                revision=plan["revision"],
+                ignore_patterns=["__pycache__/**", "*.tmp", "*.log"],
+            )
+            uploaded["hf_lora"] = {"repo_id": plan["lora_repo"], "path": lora_dir}
+
+        if plan["request_merged"]:
+            merged_dir = training_result.get("merged_dir")
+            if not merged_dir or not Path(merged_dir).exists():
+                raise RuntimeError("Merged upload requested but merged_dir is missing")
+
+            self._normalize_model_card_metadata(merged_dir, training_result)
+
+            api.create_repo(
+                repo_id=plan["merged_repo"],
+                repo_type="model",
+                private=plan["private"],
+                exist_ok=True,
+            )
+            api.upload_folder(
+                repo_id=plan["merged_repo"],
+                repo_type="model",
+                folder_path=merged_dir,
+                commit_message=plan["commit_message"],
+                revision=plan["revision"],
+                ignore_patterns=["__pycache__/**", "*.tmp", "*.log"],
+            )
+            uploaded["hf_merged"] = {"repo_id": plan["merged_repo"], "path": merged_dir}
+
+        return uploaded
+
+    def _upload_file_to_hf(
+        self,
+        api: HfApi,
+        repo_id: str,
+        file_path: str,
+        path_in_repo: str,
+        commit_message: str,
+        revision: Optional[str] = None,
+    ) -> Optional[str]:
+        path = Path(file_path)
+        if not path.exists():
+            return None
+
+        api.upload_file(
+            path_or_fileobj=str(path),
+            path_in_repo=path_in_repo,
+            repo_id=repo_id,
+            repo_type="model",
+            commit_message=commit_message,
+            revision=revision,
+        )
+        return path_in_repo
+
+    def upload_hf_metadata(
+        self,
+        log_file: str,
+        effective_config_path: str,
+        result_path: str,
+        training_result: Dict,
+        eval_result: Optional[Dict] = None,
+    ) -> Dict[str, Dict[str, Any]]:
+        uploaded: Dict[str, Dict[str, Any]] = {}
+        plan = self._hf_plan()
+
+        if not plan["request_metadata"]:
+            return uploaded
+
+        repo_id = plan["metadata_repo"]
+        if not repo_id:
+            return uploaded
+
+        api = build_hf_api()
+        api.create_repo(
+            repo_id=repo_id,
+            repo_type="model",
+            private=plan["private"],
+            exist_ok=True,
+        )
+
+        commit_message = f"{plan['commit_message']} (metadata)"
+        revision = plan["revision"]
+
+        uploaded_files: list[str] = []
+
+        file_specs = [
+            (log_file, "artifacts/logs/trainer.log"),
+            (effective_config_path, "artifacts/config/effective-job.json"),
+            (result_path, "artifacts/result/job-result.json"),
+        ]
+
+        if training_result.get("metrics_path"):
+            file_specs.append(
+                (training_result["metrics_path"], "artifacts/train/train_metrics.json")
+            )
+        if training_result.get("history_path"):
+            file_specs.append(
+                (training_result["history_path"], "artifacts/train/train_history.json")
+            )
+        if training_result.get("train_summary_path"):
+            file_specs.append(
+                (training_result["train_summary_path"], "artifacts/train/train_summary.json")
+            )
+
+        if eval_result:
+            if eval_result.get("summary_json_path"):
+                file_specs.append(
+                    (eval_result["summary_json_path"], "artifacts/evaluation/summary.json")
+                )
+            if eval_result.get("result_json_path"):
+                file_specs.append(
+                    (eval_result["result_json_path"], "artifacts/evaluation/result.json")
+                )
+            if eval_result.get("summary_csv_path"):
+                file_specs.append(
+                    (eval_result["summary_csv_path"], "artifacts/evaluation/summary.csv")
+                )
+            if eval_result.get("detailed_csv_path"):
+                file_specs.append(
+                    (eval_result["detailed_csv_path"], "artifacts/evaluation/detailed.csv")
+                )
+
+        for local_path, path_in_repo in file_specs:
+            uploaded_path = self._upload_file_to_hf(
+                api=api,
+                repo_id=repo_id,
+                file_path=local_path,
+                path_in_repo=path_in_repo,
+                commit_message=commit_message,
+                revision=revision,
+            )
+            if uploaded_path:
+                uploaded_files.append(uploaded_path)
+
+        uploaded["hf_metadata"] = {
+            "repo_id": repo_id,
+            "files": uploaded_files,
+        }
+        return uploaded
+
+
+path: /app/asset_manager.py
+----------------------------------------
+from __future__ import annotations
+
+from pathlib import Path
+from urllib.parse import urlparse
+
+import requests
+
+from schemas import JobConfig
+
+
+class AssetManager:
+    def __init__(self, cfg: JobConfig):
+        self.cfg = cfg
+        self.download_dir = Path(cfg.outputs.downloads_dir)
+
+    def _infer_suffix(self, url: str, default_suffix: str = ".json") -> str:
+        parsed = urlparse(url)
+        suffix = Path(parsed.path).suffix
+        return suffix or default_suffix
+
+    def download_file(self, url: str, dest_path: Path) -> Path:
+        print(f"==> downloading {url} to {dest_path}")
+        dest_path.parent.mkdir(parents=True, exist_ok=True)
+
+        with requests.get(url, stream=True, timeout=120) as response:
+            response.raise_for_status()
+            with dest_path.open("wb") as f:
+                for chunk in response.iter_content(chunk_size=1024 * 1024):
+                    if chunk:
+                        f.write(chunk)
+
+        return dest_path
+
+    def prepare_dataset(self, cfg: JobConfig) -> None:
+        if cfg.dataset.source != "url":
+            return
+
+        dataset_dir = self.download_dir / "dataset"
+        dataset_dir.mkdir(parents=True, exist_ok=True)
+
+        if cfg.dataset.train_url:
+            train_suffix = self._infer_suffix(cfg.dataset.train_url, ".json")
+            train_path = dataset_dir / f"train{train_suffix}"
+            self.download_file(cfg.dataset.train_url, train_path)
+            cfg.dataset.train_path = str(train_path)
+
+        if cfg.dataset.val_url:
+            val_suffix = self._infer_suffix(cfg.dataset.val_url, ".json")
+            val_path = dataset_dir / f"val{val_suffix}"
+            self.download_file(cfg.dataset.val_url, val_path)
+            cfg.dataset.val_path = str(val_path)
+
+        print("==> dataset prepared")
+
+    def prepare_evaluation_dataset(self, cfg: JobConfig) -> None:
+        if not cfg.evaluation.enabled or not cfg.evaluation.dataset:
+            return
+
+        eval_cfg = cfg.evaluation.dataset
+        if eval_cfg.source != "url" or not eval_cfg.url:
+            return
+
+        eval_dir = self.download_dir / "evaluation"
+        eval_dir.mkdir(parents=True, exist_ok=True)
+
+        eval_suffix = self._infer_suffix(
+            eval_cfg.url,
+            ".jsonl" if eval_cfg.format == "jsonl" else ".json",
+        )
+        eval_path = eval_dir / f"evaluation{eval_suffix}"
+
+        self.download_file(eval_cfg.url, eval_path)
+        eval_cfg.path = str(eval_path)
+
+        print("==> evaluation dataset prepared")
+
+
+path: /app/bootstrap_loader.py
+----------------------------------------
+from __future__ import annotations
+
+import copy
+from typing import Any, Dict, Tuple
+
+from archiver import build_retry_session
+from schemas import JobConfig
+
+
+def _resolve_callback_url(payload: Dict[str, Any], key: str) -> str | None:
+    explicit = payload.get(f"{key}_url")
+    if isinstance(explicit, str) and explicit.strip():
+        return explicit.strip()
+
+    reporting = payload.get("reporting") or {}
+    value = reporting.get(key)
+
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+
+    if isinstance(value, dict):
+        url = value.get("url")
+        if isinstance(url, str) and url.strip():
+            return url.strip()
+
+    return None
+
+
+def load_remote_job_config(
+    job_config_url: str,
+    timeout_sec: int = 30,
+) -> Tuple[JobConfig, Dict[str, Any]]:
+    resolved_url = str(job_config_url or "").strip()
+    if not resolved_url:
+        raise ValueError("JOB_CONFIG_URL is empty")
+
+    session = build_retry_session(total_retries=3)
+
+    print(f"==> loading remote job config from {resolved_url}")
+    response = session.get(resolved_url, timeout=(10, timeout_sec))
+    response.raise_for_status()
+    payload = response.json()
+
+    if not isinstance(payload, dict):
+        raise ValueError("Remote job config response must be a JSON object")
+
+    callback_auth_token = payload.get("callback_auth_token")
+
+    if "config" in payload:
+        raw_config = copy.deepcopy(payload.get("config") or {})
+        if not raw_config.get("job_id") and payload.get("job_id"):
+            raw_config["job_id"] = payload["job_id"]
+        if not raw_config.get("job_name") and payload.get("job_name"):
+            raw_config["job_name"] = payload["job_name"]
+    else:
+        raw_config = copy.deepcopy(payload)
+
+    if not isinstance(raw_config, dict):
+        raise ValueError("Remote config payload is invalid")
+
+    raw_config["mode"] = "remote"
+
+    reporting = raw_config.setdefault("reporting", {})
+    for key in ("status", "progress", "final", "logs"):
+        callback_cfg = copy.deepcopy(reporting.get(key) or {})
+        explicit_url = _resolve_callback_url(payload, key)
+
+        if explicit_url:
+            callback_cfg["enabled"] = True
+            callback_cfg["url"] = explicit_url
+
+        auth_cfg = copy.deepcopy(callback_cfg.get("auth") or {})
+        if callback_auth_token and not auth_cfg.get("bearer_token"):
+            auth_cfg["bearer_token"] = callback_auth_token
+
+        callback_cfg["auth"] = auth_cfg
+
+        if callback_cfg.get("url"):
+            callback_cfg["enabled"] = bool(callback_cfg.get("enabled", True))
+
+        reporting[key] = callback_cfg
+
+    raw_config["reporting"] = reporting
+
+    cfg = JobConfig.model_validate(raw_config)
+
+    logs_url = (
+        _resolve_callback_url(payload, "logs")
+        or _resolve_callback_url(raw_config, "logs")
+    )
+
+    meta = {
+        "job_config_url": resolved_url,
+        "logs_url": logs_url,
+        "callback_auth_token": callback_auth_token,
+    }
+    return cfg, meta
+
+
+path: /app/config_loader.py
+----------------------------------------
+import copy
+import json
+from pathlib import Path
+from typing import Any, Dict
+
+import requests
+
+from schemas import JobConfig
+
+
+def _migrate_legacy_config(raw: Dict[str, Any], source_ref: str) -> Dict[str, Any]:
+    data = copy.deepcopy(raw)
+
+    if "base_model" in data and "model" not in data:
+        base_model = data.get("base_model") or {}
+        model_source = "local" if base_model.get("local_path") else "huggingface"
+        data["model"] = {
+            "source": model_source,
+            "local_path": base_model.get("local_path"),
+            "repo_id": base_model.get("repo_id"),
+            "revision": base_model.get("revision", "main"),
+            "trust_remote_code": base_model.get("trust_remote_code", False),
+            "load_in_4bit": base_model.get("load_in_4bit"),
+            "dtype": base_model.get("dtype", "auto"),
+            "max_seq_length": base_model.get("max_seq_length", 4096),
+        }
+
+    if "artifacts" in data and "outputs" not in data:
+        artifacts = data.get("artifacts") or {}
+        training = data.get("training") or {}
+
+        base_dir = artifacts.get("output_dir") or "/output"
+        lora_subdir = artifacts.get("lora_subdir", "lora")
+        merged_subdir = artifacts.get("merged_subdir", "merged")
+
+        data["outputs"] = {
+            "base_dir": base_dir,
+            "logs_dir": f"{base_dir}/logs",
+            "lora_dir": f"{base_dir}/{lora_subdir}",
+            "checkpoints_dir": training.get("output_dir") or f"{base_dir}/checkpoints",
+            "metrics_dir": f"{base_dir}/metrics",
+            "merged_dir": f"{base_dir}/{merged_subdir}",
+            "quantized_dir": f"{base_dir}/quantized",
+            "eval_dir": f"{base_dir}/evaluation",
+            "downloads_dir": f"{base_dir}/downloads",
+        }
+
+        postprocess = data.setdefault("postprocess", {})
+        if "save_merged_16bit" in artifacts and "save_merged_16bit" not in postprocess:
+            postprocess["save_merged_16bit"] = artifacts["save_merged_16bit"]
+        if artifacts.get("save_merged_16bit") and "merge_lora" not in postprocess:
+            postprocess["merge_lora"] = True
+
+    if "report_url" in data and "reporting" not in data:
+        report_url = data.get("report_url")
+        if report_url:
+            data["reporting"] = {
+                "status": {"enabled": True, "url": report_url},
+                "progress": {"enabled": True, "url": report_url},
+                "final": {"enabled": True, "url": report_url},
+            }
+
+    if "mode" not in data:
+        if source_ref.startswith("http://") or source_ref.startswith("https://"):
+            data["mode"] = "remote"
+        else:
+            data["mode"] = "local"
+
+    return data
+
+
+def load_config(path: str) -> JobConfig:
+    if path.startswith("http://") or path.startswith("https://"):
+        print(f"==> loading remote config from {path}")
+        response = requests.get(path, timeout=30)
+        response.raise_for_status()
+        raw = response.json()
+    else:
+        config_path = Path(path)
+        if not config_path.exists():
+            raise FileNotFoundError(f"Config not found: {path}")
+
+        with config_path.open("r", encoding="utf-8") as f:
+            raw = json.load(f)
+
+    migrated = _migrate_legacy_config(raw, path)
+    return JobConfig.model_validate(migrated)
+
+
+path: /app/eval_runner.py
+----------------------------------------
+from __future__ import annotations
+
+import csv
+import json
+import logging
+import math
+import re
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+import torch
+from peft import PeftModel
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+from reporter import Reporter
+from schemas import JobConfig
+
+logger = logging.getLogger(__name__)
+
+
+def resolve_torch_dtype(dtype_value: str):
+    value = str(dtype_value or "auto").lower().strip()
+    if value == "auto":
+        return "auto"
+    if value in ("float16", "half", "fp16"):
+        return torch.float16
+    if value in ("bfloat16", "bf16"):
+        return torch.bfloat16
+    if value in ("float32", "float", "fp32"):
+        return torch.float32
+    return "auto"
+
+
+def render_prompt_template(template: str, sample: Dict[str, Any]) -> str:
+    tags = sample.get("hash_tags") or []
+    tags_text = ", ".join(tags) if isinstance(tags, list) and tags else "none"
+
+    rendered = template
+    replacements = {
+        "${question}": str(sample.get("question", "")),
+        "${candidateAnswer}": str(sample.get("candidate_answer", "")),
+        "${referenceScore}": str(sample.get("reference_score", "")),
+        "${maxScore}": str(sample.get("max_score", 5)),
+        "${tagsText}": tags_text,
+    }
+
+    for key, value in replacements.items():
+        rendered = rendered.replace(key, value)
+
+    return rendered
+
+
+def extract_generated_text(tokenizer, prompt_text: str, output_ids, input_len: int) -> str:
+    generated_ids = output_ids[0][input_len:]
+    return tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
+
+
+def parse_model_score(
+    text: str,
+    parsing_regex: Optional[str] = None,
+    score_min: float = 0.0,
+    score_max: float = 5.0,
+) -> Dict[str, Any]:
+    if not text or not str(text).strip():
+        return {"score": None, "feedback": None, "parseError": True}
+
+    clean_text = str(text).strip()
+
+    try:
+        json_match = re.search(r"\{[\s\S]*\}", clean_text)
+        if json_match:
+            data = json.loads(json_match.group(0))
+            raw_score = data.get("score")
+            if isinstance(raw_score, str):
+                raw_score = float(raw_score)
+            if isinstance(raw_score, (int, float)) and math.isfinite(raw_score):
+                if score_min <= raw_score <= score_max:
+                    return {
+                        "score": float(raw_score),
+                        "feedback": data.get("feedback") or data.get("reasoning"),
+                        "parseError": False,
+                    }
+    except Exception:
+        pass
+
+    patterns = []
+    if parsing_regex:
+        patterns.append(parsing_regex)
+
+    # Defaults
+    patterns.extend([
+        fr"score:\s*(\d+(?:\.\d+)?)\s*/\s*{int(score_max)}",
+        fr"оценка:\s*(\d+(?:\.\d+)?)\s*/\s*{int(score_max)}",
+        r"score:\s*(\d+(?:\.\d+)?)",
+        r"оценка:\s*(\d+(?:\.\d+)?)",
+        fr"(\d+(?:\.\d+)?)\s*/\s*{int(score_max)}",
+        r"^(\d+(?:\.\d+)?)$",
+    ])
+
+    for pattern in patterns:
+        try:
+            match = re.search(pattern, clean_text, re.IGNORECASE | re.MULTILINE)
+            if not match:
+                continue
+            value = float(match.group(1))
+            if score_min <= value <= score_max:
+                return {
+                    "score": value,
+                    "feedback": clean_text,
+                    "parseError": False,
+                }
+        except Exception:
+            continue
+
+    return {
+        "score": None,
+        "feedback": clean_text,
+        "parseError": True,
+    }
+
+
+def calculate_metrics(model_label: str, rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    valid_rows = [
+        row
+        for row in rows
+        if not row.get("parseError") and isinstance(row.get("predictedScore"), (int, float))
+    ]
+    total_samples = len(rows)
+
+    if not valid_rows:
+        return {
+            "model": model_label,
+            "samples": total_samples,
+            "parseSuccessRate": 0.0,
+            "mae": None,
+            "rmse": None,
+            "exactRate": 0.0,
+            "within1Rate": 0.0,
+            "within2Rate": 0.0,
+            "meanSignedError": None,
+            "avgPredictedScore": None,
+            "parseErrors": sum(1 for row in rows if row.get("parseError")),
+            "inferenceErrors": sum(1 for row in rows if row.get("inferenceError")),
+            "emptyResponses": sum(1 for row in rows if not str(row.get("rawResponse") or "").strip()),
+        }
+
+    n = len(valid_rows)
+    abs_errors = []
+    sq_errors = []
+    signed_errors = []
+    exact = 0
+    within1 = 0
+    within2 = 0
+    predicted_sum = 0.0
+
+    for row in valid_rows:
+        error = float(row["predictedScore"]) - float(row["referenceScore"])
+        abs_error = abs(error)
+        abs_errors.append(abs_error)
+        sq_errors.append(error * error)
+        signed_errors.append(error)
+        predicted_sum += float(row["predictedScore"])
+
+        if abs_error == 0:
+            exact += 1
+        if abs_error <= 1:
+            within1 += 1
+        if abs_error <= 2:
+            within2 += 1
+
+    return {
+        "model": model_label,
+        "samples": total_samples,
+        "parseSuccessRate": n / total_samples if total_samples else 0.0,
+        "mae": sum(abs_errors) / n,
+        "rmse": math.sqrt(sum(sq_errors) / n),
+        "exactRate": exact / n,
+        "within1Rate": within1 / n,
+        "within2Rate": within2 / n,
+        "meanSignedError": sum(signed_errors) / n,
+        "avgPredictedScore": predicted_sum / n,
+        "parseErrors": sum(1 for row in rows if row.get("parseError")),
+        "inferenceErrors": sum(1 for row in rows if row.get("inferenceError")),
+        "emptyResponses": sum(1 for row in rows if not str(row.get("rawResponse") or "").strip()),
+    }
+
+
+def _load_eval_items(path: str, fmt: str) -> List[Dict[str, Any]]:
+    file_path = Path(path)
+    if not file_path.exists():
+        raise FileNotFoundError(f"Evaluation dataset not found: {path}")
+
+    if fmt == "json":
+        with file_path.open("r", encoding="utf-8") as f:
+            payload = json.load(f)
+        if isinstance(payload, dict) and isinstance(payload.get("samples"), list):
+            return payload["samples"]
+        if isinstance(payload, list):
+            return payload
+        raise ValueError("evaluation dataset json must be a list or an object with 'samples'")
+
+    items: List[Dict[str, Any]] = []
+    with file_path.open("r", encoding="utf-8") as f:
+        for line in f:
+            raw = line.strip()
+            if not raw:
+                continue
+            items.append(json.loads(raw))
+    return items
+
+
+def _normalize_eval_items(cfg: JobConfig) -> List[Dict[str, Any]]:
+    eval_cfg = cfg.evaluation
+    ds_cfg = eval_cfg.dataset
+    assert ds_cfg is not None
+
+    if not ds_cfg.path:
+        raise ValueError("evaluation.dataset.path is required before evaluation starts")
+
+    raw_items = _load_eval_items(ds_cfg.path, ds_cfg.format)
+    normalized: List[Dict[str, Any]] = []
+
+    for idx, item in enumerate(raw_items):
+        question = item.get(ds_cfg.question_field)
+        answer = item.get(ds_cfg.answer_field)
+        score = item.get(ds_cfg.score_field)
+        max_score = item.get(ds_cfg.max_score_field) if ds_cfg.max_score_field else 5
+        tags = item.get(ds_cfg.tags_field) if ds_cfg.tags_field else []
+
+        if question is None or answer is None or score is None:
+            continue
+
+        try:
+            reference_score = float(score)
+        except Exception:
+            continue
+
+        if not isinstance(tags, list):
+            tags = []
+
+        normalized.append(
+            {
+                "id": item.get("id") or f"sample_{idx + 1}",
+                "question": str(question),
+                "candidate_answer": str(answer),
+                "reference_score": reference_score,
+                "max_score": max_score if isinstance(max_score, (int, float)) else 5,
+                "hash_tags": [str(tag) for tag in tags],
+            }
+        )
+
+    if cfg.evaluation.max_samples:
+        normalized = normalized[: cfg.evaluation.max_samples]
+
+    return normalized
+
+
+def _build_prompt(tokenizer, template: str, sample: Dict[str, Any], system_prompt: Optional[str] = None) -> str:
+    rendered = render_prompt_template(template, sample)
+    messages = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+    messages.append({"role": "user", "content": rendered})
+
+    try:
+        return tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+    except Exception:
+        return rendered
+
+
+def _load_eval_model(cfg: JobConfig, training_result: Dict[str, Any]) -> tuple[Any, Any, str]:
+    target = cfg.evaluation.target
+    if target == "auto":
+        target = "merged" if training_result.get("merged_dir") else "lora"
+
+    torch_dtype = resolve_torch_dtype(cfg.model.dtype)
+
+    if target == "merged":
+        merged_dir = training_result.get("merged_dir")
+        if not merged_dir or not Path(merged_dir).exists():
+            raise ValueError("Merged model directory is missing, but evaluation.target='merged'")
+        model_label = str(merged_dir)
+        tokenizer = AutoTokenizer.from_pretrained(
+            merged_dir,
+            trust_remote_code=cfg.model.trust_remote_code,
+        )
+        model = AutoModelForCausalLM.from_pretrained(
+            merged_dir,
+            device_map="auto",
+            torch_dtype=torch_dtype,
+            trust_remote_code=cfg.model.trust_remote_code,
+        )
+        return model, tokenizer, model_label
+
+    base_model = cfg.model.local_path if cfg.model.source == "local" else cfg.model.repo_id
+    if not base_model:
+        raise ValueError("Cannot resolve base model for LoRA evaluation")
+
+    lora_dir = training_result.get("lora_dir")
+    if not lora_dir or not Path(lora_dir).exists():
+        raise ValueError("LoRA adapter directory is missing, but evaluation.target='lora'")
+
+    model_kwargs = {
+        "device_map": "auto",
+        "torch_dtype": torch_dtype,
+        "trust_remote_code": cfg.model.trust_remote_code,
+    }
+    if cfg.model.load_in_4bit:
+        model_kwargs["load_in_4bit"] = True
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        base_model,
+        trust_remote_code=cfg.model.trust_remote_code,
+    )
+    model = AutoModelForCausalLM.from_pretrained(base_model, **model_kwargs)
+    model = PeftModel.from_pretrained(model, lora_dir)
+
+    return model, tokenizer, f"{base_model}+lora"
+
+
+def run_evaluation(
+    cfg: JobConfig,
+    training_result: Dict[str, Any],
+    reporter: Optional[Reporter] = None,
+) -> Dict[str, Any]:
+    if not cfg.evaluation.enabled:
+        return {"enabled": False}
+
+    if reporter:
+        reporter.report_status(
+            "running",
+            stage="evaluation_prepare",
+            progress=0,
+            message="preparing evaluation",
+        )
+
+    samples = _normalize_eval_items(cfg)
+    if not samples:
+        raise ValueError("Evaluation dataset is empty after normalization")
+
+    model, tokenizer, model_label = _load_eval_model(cfg, training_result)
+
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    output_dir = Path(cfg.outputs.eval_dir) / cfg.job_name
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    rows: List[Dict[str, Any]] = []
+    total = len(samples)
+
+    if reporter:
+        reporter.report_status(
+            "running",
+            stage="evaluation",
+            progress=0,
+            message="evaluation started",
+            extra={"samples": total, "model": model_label},
+        )
+
+    model.eval()
+
+    for index, sample in enumerate(samples, start=1):
+        prompt = _build_prompt(
+            tokenizer,
+            cfg.evaluation.prompt_template,
+            sample,
+            system_prompt=cfg.evaluation.system_prompt,
+        )
+
+        row = {
+            "sampleId": sample["id"],
+            "question": sample["question"],
+            "candidateAnswer": sample["candidate_answer"],
+            "referenceScore": sample["reference_score"],
+            "maxScore": sample["max_score"],
+            "hashTags": sample["hash_tags"],
+            "predictedScore": None,
+            "predictedFeedback": None,
+            "rawResponse": None,
+            "parseError": True,
+            "inferenceError": False,
+            "absoluteError": None,
+        }
+
+        try:
+            encoded = tokenizer(prompt, return_tensors="pt")
+            model_inputs = {k: v.to(model.device) for k, v in encoded.items()}
+
+            with torch.no_grad():
+                output_ids = model.generate(
+                    **model_inputs,
+                    max_new_tokens=cfg.evaluation.max_new_tokens,
+                    do_sample=cfg.evaluation.do_sample,
+                    temperature=cfg.evaluation.temperature if cfg.evaluation.do_sample else 1.0,
+                    pad_token_id=tokenizer.pad_token_id,
+                    eos_token_id=tokenizer.eos_token_id,
+                )
+
+            raw_response = extract_generated_text(
+                tokenizer=tokenizer,
+                prompt_text=prompt,
+                output_ids=output_ids,
+                input_len=int(model_inputs["input_ids"].shape[1]),
+            )
+
+            parsed = parse_model_score(
+                raw_response,
+                parsing_regex=cfg.evaluation.parsing_regex,
+                score_min=cfg.evaluation.score_min,
+                score_max=cfg.evaluation.score_max,
+            )
+
+            row["rawResponse"] = raw_response
+            row["predictedScore"] = parsed["score"]
+            row["predictedFeedback"] = parsed["feedback"]
+            row["parseError"] = parsed["parseError"]
+
+            if isinstance(parsed["score"], (int, float)):
+                row["absoluteError"] = abs(float(parsed["score"]) - float(sample["reference_score"]))
+
+        except Exception as exc:
+            row["rawResponse"] = ""
+            row["inferenceError"] = True
+            row["parseError"] = True
+            row["error"] = str(exc)
+
+        rows.append(row)
+
+        if reporter and (index == 1 or index == total or index % max(1, total // 10) == 0):
+            reporter.report_progress(
+                stage="evaluation",
+                progress=round((index / total) * 100, 2),
+                message=f"evaluated {index}/{total} samples",
+                extra={
+                    "processed": index,
+                    "total": total,
+                    "model": model_label,
+                },
+            )
+
+    metrics = calculate_metrics(model_label, rows)
+
+    summary_json_path = output_dir / "summary.json"
+    result_json_path = output_dir / "result.json"
+    summary_csv_path = output_dir / "summary.csv"
+    detailed_csv_path = output_dir / "detailed.csv"
+
+    with result_json_path.open("w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "model": model_label,
+                "metrics": metrics,
+                "rows": rows,
+            },
+            f,
+            indent=2,
+            ensure_ascii=False,
+        )
+
+    with summary_json_path.open("w", encoding="utf-8") as f:
+        json.dump(metrics, f, indent=2, ensure_ascii=False)
+
+    with summary_csv_path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "model",
+                "samples",
+                "parseSuccessRate",
+                "mae",
+                "rmse",
+                "exactRate",
+                "within1Rate",
+                "within2Rate",
+                "meanSignedError",
+                "avgPredictedScore",
+                "parseErrors",
+                "inferenceErrors",
+                "emptyResponses",
+            ],
+        )
+        writer.writeheader()
+        writer.writerow(metrics)
+
+    with detailed_csv_path.open("w", encoding="utf-8", newline="") as f:
+        fieldnames = [
+            "sampleId",
+            "question",
+            "candidateAnswer",
+            "referenceScore",
+            "maxScore",
+            "predictedScore",
+            "absoluteError",
+            "parseError",
+            "inferenceError",
+            "hashTags",
+            "predictedFeedback",
+            "rawResponse",
+        ]
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(
+                {
+                    "sampleId": row.get("sampleId"),
+                    "question": row.get("question"),
+                    "candidateAnswer": row.get("candidateAnswer"),
+                    "referenceScore": row.get("referenceScore"),
+                    "maxScore": row.get("maxScore"),
+                    "predictedScore": row.get("predictedScore"),
+                    "absoluteError": row.get("absoluteError"),
+                    "parseError": row.get("parseError"),
+                    "inferenceError": row.get("inferenceError"),
+                    "hashTags": ", ".join(row.get("hashTags") or []),
+                    "predictedFeedback": row.get("predictedFeedback"),
+                    "rawResponse": row.get("rawResponse"),
+                }
+            )
+
+    try:
+        del model
+        torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+    if reporter:
+        reporter.report_status(
+            "running",
+            stage="evaluation_completed",
+            progress=100,
+            message="evaluation completed",
+            extra=metrics,
+        )
+
+    return {
+        "enabled": True,
+        "target": cfg.evaluation.target,
+        "model": model_label,
+        "summary": metrics,
+        "summary_json_path": str(summary_json_path),
+        "result_json_path": str(result_json_path),
+        "summary_csv_path": str(summary_csv_path),
+        "detailed_csv_path": str(detailed_csv_path),
+    }
+
+
+path: /app/hf_utils.py
+----------------------------------------
+from __future__ import annotations
+
+import os
+from typing import Optional
+
+from huggingface_hub import HfApi
+
+
+def get_hf_token() -> Optional[str]:
+    return (
+        os.environ.get("HF_TOKEN")
+        or os.environ.get("HUGGINGFACE_HUB_TOKEN")
+        or os.environ.get("HUGGINGFACE_TOKEN")
+    )
+
+
+def build_hf_api() -> HfApi:
+    token = get_hf_token()
+    if not token:
+        raise RuntimeError("HF upload requested but HF_TOKEN is not set")
+    return HfApi(token=token)
+
+
+def validate_hf_token() -> dict:
+    api = build_hf_api()
+    return api.whoami()
+
+
+def try_hf_login() -> bool:
+    token = get_hf_token()
+    if not token:
+        print("==> HF_TOKEN not set, skip HF auth check")
+        return False
+
+    info = HfApi(token=token).whoami()
+    name = info.get("name") or info.get("fullname") or "unknown"
+    print(f"==> Hugging Face auth success: {name}")
+    return True
+
+
+path: /app/log_streamer.py
+----------------------------------------
+from __future__ import annotations
+
+import logging
+import sys
+import threading
+from typing import Dict, Optional
+
+from archiver import build_retry_session
+
+
+class LogStreamer(logging.Handler):
+    def __init__(
+        self,
+        logs_url: str,
+        job_id: str,
+        job_name: str,
+        bearer_token: Optional[str] = None,
+        timeout_sec: int = 10,
+    ):
+        super().__init__()
+        self.logs_url = str(logs_url or "").strip()
+        self.job_id = job_id
+        self.job_name = job_name
+        self.timeout_sec = timeout_sec
+        self.session = build_retry_session(total_retries=2)
+        self.lock = threading.Lock()
+        self.offset = 0
+
+        self.headers: Dict[str, str] = {"Content-Type": "application/json"}
+        if bearer_token:
+            self.headers["Authorization"] = f"Bearer {bearer_token}"
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            message = self.format(record)
+            if not message:
+                return
+
+            chunk = f"{message}\n"
+            encoded = chunk.encode("utf-8", errors="replace")
+
+            with self.lock:
+                current_offset = self.offset
+                self.offset += len(encoded)
+
+            payload = {
+                "job_id": self.job_id,
+                "job_name": self.job_name,
+                "offset": current_offset,
+                "chunk": chunk,
+            }
+
+            response = self.session.post(
+                self.logs_url,
+                json=payload,
+                headers=self.headers,
+                timeout=(5, self.timeout_sec),
+            )
+            response.raise_for_status()
+        except Exception as exc:
+            try:
+                sys.stderr.write(f"[log-streamer] failed to send log chunk: {exc}\n")
+                sys.stderr.flush()
+            except Exception:
+                pass
+
+    def close(self) -> None:
+        try:
+            self.session.close()
+        except Exception:
+            pass
+        super().close()
+
+
+path: /app/quant_awq.py
+----------------------------------------
+
+
+
+path: /app/reporter.py
+----------------------------------------
+from __future__ import annotations
+
+import logging
+import time
+from typing import Any, Dict, List
+
+from archiver import build_retry_session
+from schemas import CallbackConfig, JobConfig
+
+logger = logging.getLogger(__name__)
+
+
+class Reporter:
+    def __init__(self, cfg: JobConfig):
+        self.cfg = cfg
+        self.job_name = cfg.job_name
+        self.job_id = cfg.job_id or cfg.job_name
+        self.session = build_retry_session(total_retries=2)
+
+    def _build_headers(self, callback: CallbackConfig) -> Dict[str, str]:
+        headers: Dict[str, str] = {"Content-Type": "application/json"}
+        if callback.auth.headers:
+            headers.update(callback.auth.headers)
+        if callback.auth.bearer_token:
+            headers["Authorization"] = f"Bearer {callback.auth.bearer_token}"
+        return headers
+
+    def _callbacks_for(self, event_kind: str) -> List[CallbackConfig]:
+        callbacks: List[CallbackConfig] = []
+
+        if event_kind == "status" and self.cfg.reporting.status.active:
+            callbacks.append(self.cfg.reporting.status)
+        elif event_kind == "progress" and self.cfg.reporting.progress.active:
+            callbacks.append(self.cfg.reporting.progress)
+        elif event_kind == "final" and self.cfg.reporting.final.active:
+            callbacks.append(self.cfg.reporting.final)
+
+        if not callbacks and self.cfg.report_url:
+            callbacks.append(
+                CallbackConfig(
+                    enabled=True,
+                    url=self.cfg.report_url,
+                    timeout_sec=15,
+                )
+            )
+
+        return callbacks
+
+    def _emit(self, event_kind: str, payload: Dict[str, Any]) -> None:
+        callbacks = self._callbacks_for(event_kind)
+        if not callbacks:
+            return
+
+        payload = {
+            "job_id": self.job_id,
+            "job_name": self.job_name,
+            "event": event_kind,
+            "timestamp": time.time(),
+            **payload,
+        }
+
+        for callback in callbacks:
+            try:
+                logger.info("==> reporting %s to %s", event_kind, callback.url)
+                response = self.session.post(
+                    callback.url,
+                    json=payload,
+                    headers=self._build_headers(callback),
+                    timeout=(5, callback.timeout_sec),
+                )
+                response.raise_for_status()
+            except Exception as exc:
+                logger.warning("failed to report %s: %s", event_kind, exc)
+
+    def report_status(
+        self,
+        status: str,
+        message: str | None = None,
+        stage: str | None = None,
+        progress: float | None = None,
+        extra: Dict[str, Any] | None = None,
+        logs: str | None = None,
+    ) -> None:
+        self._emit(
+            "status",
+            {
+                "status": status,
+                "stage": stage,
+                "progress": progress,
+                "message": message,
+                "logs": logs,
+                "extra": extra or {},
+            },
+        )
+
+    def report_progress(
+        self,
+        stage: str,
+        progress: float | None = None,
+        message: str | None = None,
+        extra: Dict[str, Any] | None = None,
+    ) -> None:
+        self._emit(
+            "progress",
+            {
+                "status": "running",
+                "stage": stage,
+                "progress": progress,
+                "message": message,
+                "extra": extra or {},
+            },
+        )
+
+    def report_final(self, result: Dict[str, Any], status: str = "finished") -> None:
+        self._emit(
+            "final",
+            {
+                "status": status,
+                "result": result,
+            },
+        )
+
+    def report_error(
+        self,
+        error_message: str,
+        logs: str | None = None,
+        stage: str = "failed",
+        extra: Dict[str, Any] | None = None,
+    ) -> None:
+        self.report_status(
+            "failed",
+            message=error_message,
+            stage=stage,
+            progress=100,
+            extra=extra or {},
+            logs=logs,
+        )
+
+
+path: /app/runner.py
+----------------------------------------
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import sys
+import traceback
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, Optional, Tuple
+
+from archiver import Archiver
+from artifact_uploader import ArtifactUploader
+from asset_manager import AssetManager
+from bootstrap_loader import load_remote_job_config
+from config_loader import load_config
+from eval_runner import run_evaluation
+from hf_utils import try_hf_login
+from log_streamer import LogStreamer
+from reporter import Reporter
+from train_runner import run_training
+
+logger = logging.getLogger(__name__)
+
+
+def setup_logging(
+    logs_dir: str,
+    job_id: Optional[str] = None,
+    job_name: Optional[str] = None,
+    logs_url: Optional[str] = None,
+    logs_bearer_token: Optional[str] = None,
+):
+    logs_path = Path(logs_dir)
+    logs_path.mkdir(parents=True, exist_ok=True)
+    log_file = logs_path / "trainer.log"
+
+    formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+
+    handlers: list[logging.Handler] = [
+        logging.FileHandler(log_file),
+        logging.StreamHandler(sys.stdout),
+    ]
+
+    if logs_url and job_id and job_name:
+        streamer = LogStreamer(
+            logs_url=logs_url,
+            job_id=job_id,
+            job_name=job_name,
+            bearer_token=logs_bearer_token,
+        )
+        streamer.setFormatter(formatter)
+        handlers.append(streamer)
+
+    for handler in handlers:
+        handler.setFormatter(formatter)
+
+    logging.basicConfig(
+        level=logging.INFO,
+        handlers=handlers,
+        force=True,
+    )
+    return log_file
+
+
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def tail_file(file_path: Path, lines: int = 50) -> str:
+    try:
+        with file_path.open("r", encoding="utf-8") as f:
+            return "".join(f.readlines()[-lines:])
+    except Exception:
+        return "Could not retrieve logs"
+
+
+def write_json(path: Path, payload: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False)
+
+
+def resolve_config(args) -> Tuple[Any, str, Dict[str, Any]]:
+    if args.job_config_url:
+        cfg, meta = load_remote_job_config(args.job_config_url)
+        return cfg, args.job_config_url, meta
+
+    if args.config:
+        cfg = load_config(args.config)
+        return cfg, args.config, {}
+
+    raise ValueError("Either --config or --job-config-url must be provided")
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", required=False)
+    parser.add_argument("--job-config-url", required=False)
+    args = parser.parse_args()
+
+    try:
+        cfg, config_source, bootstrap_meta = resolve_config(args)
+    except Exception as exc:
+        print(f"ERROR: failed to resolve config: {exc}")
+        sys.exit(1)
+
+    Path(cfg.outputs.base_dir).mkdir(parents=True, exist_ok=True)
+
+    log_file = setup_logging(
+        cfg.outputs.logs_dir,
+        job_id=cfg.job_id or cfg.job_name,
+        job_name=cfg.job_name,
+        logs_url=bootstrap_meta.get("logs_url") or cfg.reporting.logs.url,
+        logs_bearer_token=(
+            bootstrap_meta.get("callback_auth_token")
+            or cfg.reporting.logs.auth.bearer_token
+            or cfg.reporting.status.auth.bearer_token
+            or cfg.reporting.progress.auth.bearer_token
+            or cfg.reporting.final.auth.bearer_token
+        ),
+    )
+
+    reporter = Reporter(cfg)
+    asset_manager = AssetManager(cfg)
+    archiver = Archiver()
+    uploader = ArtifactUploader(cfg)
+
+    effective_config_path = Path(cfg.outputs.logs_dir) / "effective-job.json"
+    result_path = Path(cfg.outputs.base_dir) / "job-result.json"
+
+    started_at = utc_now_iso()
+
+    try:
+        reporter.report_status(
+            "started",
+            message="Training pipeline started",
+            stage="bootstrap",
+            progress=0,
+        )
+
+        write_json(effective_config_path, json.loads(cfg.model_dump_json()))
+        logger.info("==> config loaded")
+        logger.info("==> job_name: %s", cfg.job_name)
+        logger.info("==> job_id: %s", cfg.job_id or cfg.job_name)
+        logger.info("==> config source: %s", config_source)
+
+        reporter.report_status(
+            "running",
+            message="Validating Hugging Face access",
+            stage="hf_login",
+            progress=2,
+        )
+        try_hf_login()
+        uploader.ensure_hf_ready()
+
+        pipeline = cfg.pipeline
+
+        if not pipeline or pipeline.prepare_assets.enabled:
+            logger.info("==> preparing assets")
+            reporter.report_status(
+                "running",
+                message="Preparing datasets and remote assets",
+                stage="prepare_assets",
+                progress=5,
+            )
+            asset_manager.prepare_dataset(cfg)
+            asset_manager.prepare_evaluation_dataset(cfg)
+        else:
+            logger.info("==> skipping assets preparation")
+
+        training_result = {}
+        if not pipeline or pipeline.training.enabled:
+            logger.info("==> starting training")
+            training_result = run_training(cfg, reporter=reporter)
+
+            logical_base_model_id = cfg.model.logical_base_model_id
+            if logical_base_model_id and not training_result.get("base_model_id"):
+                training_result["base_model_id"] = logical_base_model_id
+                training_result["base_model_name_or_path"] = logical_base_model_id
+                summary = training_result.get("summary")
+                if isinstance(summary, dict):
+                    summary.setdefault("base_model_id", logical_base_model_id)
+                    summary.setdefault("base_model_name_or_path", logical_base_model_id)
+
+            logger.info("==> training finished")
+        else:
+            logger.info("==> skipping training stage")
+            training_result = {
+                "status": "skipped",
+                "message": "Training stage disabled in pipeline",
+            }
+
+        if cfg.postprocess.run_awq_quantization:
+            raise NotImplementedError("AWQ quantization stage is not implemented in this service yet")
+
+        evaluation_result = None
+        should_eval = False
+        if pipeline:
+            should_eval = pipeline.evaluation.enabled
+        else:
+            should_eval = cfg.evaluation.enabled
+
+        if should_eval:
+            logger.info("==> starting evaluation")
+            evaluation_result = run_evaluation(cfg, training_result, reporter=reporter)
+            logger.info("==> evaluation finished")
+        else:
+            logger.info("==> skipping evaluation stage")
+
+        result: Dict[str, Any] = {
+            "status": "success",
+            "job_id": cfg.job_id or cfg.job_name,
+            "job_name": cfg.job_name,
+            "started_at": started_at,
+            "finished_at": utc_now_iso(),
+            "config_source": config_source,
+            "training": training_result,
+            "evaluation": evaluation_result,
+            "artifacts": {
+                "log_file": str(log_file),
+                "effective_config_path": str(effective_config_path),
+                "result_path": str(result_path),
+            },
+            "uploads": {},
+            "upload_errors": {},
+        }
+
+        should_upload = False
+        if pipeline:
+            should_upload = pipeline.upload.enabled
+        else:
+            should_upload = cfg.upload.enabled
+
+        if should_upload:
+            if cfg.upload.target == "url" and cfg.upload.upload_url:
+                logger.info("==> legacy full archive upload")
+                try:
+                    archive_path = Path(cfg.outputs.base_dir) / f"{cfg.job_name}.tar.gz"
+                    archiver.make_archive(cfg.outputs.base_dir, str(archive_path))
+                    archiver.upload_archive(
+                        str(archive_path),
+                        cfg.upload.upload_url,
+                        headers=uploader._headers(),
+                        form_data={
+                            "job_id": cfg.job_id or cfg.job_name,
+                            "job_name": cfg.job_name,
+                            "artifact_type": "full_archive",
+                        },
+                        timeout_sec=cfg.upload.timeout_sec,
+                    )
+                    result["uploads"]["legacy_full_archive"] = {
+                        "url": cfg.upload.upload_url,
+                        "archive_path": str(archive_path),
+                    }
+                except Exception as exc:
+                    logger.exception("legacy full archive upload failed")
+                    result["upload_errors"]["legacy_full_archive"] = str(exc)
+
+            if cfg.upload.target == "url":
+                reporter.report_status(
+                    "running",
+                    message="Uploading URL artifacts",
+                    stage="upload_artifacts",
+                    progress=97,
+                )
+                extra_uploads, extra_upload_errors = uploader.upload_non_summary_artifacts(
+                    log_file=str(log_file),
+                    effective_config_path=str(effective_config_path),
+                    training_result=training_result,
+                    eval_result=evaluation_result,
+                )
+                if extra_uploads:
+                    result["uploads"].update(extra_uploads)
+                if extra_upload_errors:
+                    result["upload_errors"].update(extra_upload_errors)
+        else:
+            logger.info("==> skipping upload stage")
+
+        write_json(result_path, result)
+
+        should_publish = False
+        if pipeline:
+            should_publish = pipeline.publish.enabled
+        else:
+            should_publish = cfg.huggingface.enabled
+
+        if should_publish:
+            reporter.report_status(
+                "running",
+                message="Publishing artifacts to Hugging Face",
+                stage="publish_artifacts",
+                progress=98,
+            )
+
+            hf_model_uploads = uploader.upload_to_huggingface(training_result)
+            if hf_model_uploads:
+                result["uploads"].update(hf_model_uploads)
+                write_json(result_path, result)
+
+            hf_metadata_uploads = uploader.upload_hf_metadata(
+                log_file=str(log_file),
+                effective_config_path=str(effective_config_path),
+                result_path=str(result_path),
+                training_result=training_result,
+                eval_result=evaluation_result,
+            )
+            if hf_metadata_uploads:
+                result["uploads"].update(hf_metadata_uploads)
+                write_json(result_path, result)
+        else:
+            logger.info("==> skipping publish stage")
+
+        if should_upload and cfg.upload.target == "url" and cfg.upload.url_targets.summary_url:
+            try:
+                summary_upload = uploader.upload_summary(str(result_path))
+                if summary_upload:
+                    result["uploads"].update(summary_upload)
+                    write_json(result_path, result)
+            except Exception as exc:
+                logger.exception("summary upload failed")
+                result["upload_errors"]["summary"] = str(exc)
+                write_json(result_path, result)
+
+        if result["upload_errors"]:
+            logger.warning("==> pipeline finished with upload warnings: %s", result["upload_errors"])
+
+        logger.info("==> pipeline finished successfully")
+        reporter.report_status(
+            "finished",
+            message=(
+                "Training pipeline finished successfully"
+                if not result["upload_errors"]
+                else "Training completed, but some URL artifact uploads failed"
+            ),
+            stage="finished",
+            progress=100,
+        )
+        reporter.report_final(result, status="finished")
+
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+
+    except Exception as exc:
+        error_msg = str(exc)
+        stack_trace = traceback.format_exc()
+
+        logger.error("FATAL ERROR: %s", error_msg)
+        logger.error(stack_trace)
+
+        logs_tail = tail_file(log_file, 50)
+
+        failed_result = {
+            "status": "failed",
+            "job_id": cfg.job_id or cfg.job_name,
+            "job_name": cfg.job_name,
+            "started_at": started_at,
+            "finished_at": utc_now_iso(),
+            "config_source": config_source,
+            "error": error_msg,
+            "artifacts": {
+                "log_file": str(log_file),
+                "effective_config_path": str(effective_config_path),
+                "result_path": str(result_path),
+            },
+        }
+        write_json(result_path, failed_result)
+
+        reporter.report_error(error_msg, logs=logs_tail)
+        reporter.report_final(failed_result, status="failed")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
+
+
+path: /app/schemas.py
+----------------------------------------
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Dict, List, Literal, Optional
+
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+DEFAULT_EVAL_PROMPT = """Ты — беспристрастный эксперт-оценщик. Тебе предоставлен вопрос и ответ кандидата.
+Твоя задача — выставить оценку от 0 до 5, где:
+5 — идеально правильный и полный ответ,
+0 — совершенно неверный или отсутствующий ответ.
+
+Теги вопроса: ${tagsText}
+Эти теги являются метаданными. Не завышай и не занижай оценку только из-за тегов.
+
+Вопрос: ${question}
+Ответ кандидата: ${candidateAnswer}
+
+Верни результат строго в формате JSON:
+{
+  "score": <число от 0 до 5>,
+  "feedback": "<краткое пояснение>"
+}
+
+Если не можешь вернуть JSON, обязательно напиши в конце: "score: X/5"
+"""
+
+
+class AppBaseModel(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+
+class ModelConfig(AppBaseModel):
+    source: Literal["local", "huggingface"] = "local"
+    local_path: Optional[str] = None
+    repo_id: Optional[str] = None
+    revision: str = "main"
+    trust_remote_code: bool = False
+    load_in_4bit: Optional[bool] = None
+    dtype: Literal["auto", "float16", "bfloat16", "float32"] = "auto"
+    max_seq_length: int = 4096
+
+    base_model: Optional[str] = None
+    base_model_name_or_path: Optional[str] = None
+
+    @staticmethod
+    def _is_probably_local_path(value: str) -> bool:
+        value = str(value or "").strip()
+        if not value:
+            return False
+        if value.startswith("/"):
+            return True
+        if value.startswith("./") or value.startswith("../"):
+            return True
+        if value.startswith("\\") or "\\" in value:
+            return True
+        if len(value) > 1 and value[1] == ":":
+            return True
+        return False
+
+    @property
+    def logical_base_model_id(self) -> Optional[str]:
+        for candidate in (
+            self.repo_id,
+            self.base_model_name_or_path,
+            self.base_model,
+        ):
+            if not isinstance(candidate, str):
+                continue
+            value = candidate.strip()
+            if not value:
+                continue
+            if self._is_probably_local_path(value):
+                continue
+            return value
+        return None
+
+    @model_validator(mode="after")
+    def validate_source(self) -> "ModelConfig":
+        if self.source == "local" and not self.local_path:
+            raise ValueError("model.local_path is required when model.source='local'")
+        if self.source == "huggingface" and not self.repo_id:
+            raise ValueError("model.repo_id is required when model.source='huggingface'")
+        return self
+
+
+class DatasetConfig(AppBaseModel):
+    source: Literal["local", "url"] = "local"
+    train_path: Optional[str] = None
+    val_path: Optional[str] = None
+    train_url: Optional[str] = None
+    val_url: Optional[str] = None
+    format: Literal["instruction_output", "messages", "prompt_completion"] = "instruction_output"
+    input_field: str = "input"
+    output_field: str = "output"
+    messages_field: str = "messages"
+
+    @model_validator(mode="after")
+    def validate_dataset(self) -> "DatasetConfig":
+        if self.source == "local" and not self.train_path:
+            raise ValueError("dataset.train_path is required when dataset.source='local'")
+        if self.source == "url" and not self.train_url:
+            raise ValueError("dataset.train_url is required when dataset.source='url'")
+        return self
+
+
+class TrainingConfig(AppBaseModel):
+    method: Literal["lora", "qlora"] = "qlora"
+    max_seq_length: int = 4096
+    per_device_train_batch_size: int = 1
+    gradient_accumulation_steps: int = 8
+    num_train_epochs: int = 1
+    learning_rate: float = 1e-4
+    warmup_ratio: float = 0.03
+    logging_steps: int = 1
+    save_steps: int = 50
+    eval_steps: int = 50
+    bf16: bool = True
+    packing: bool = True
+    save_total_limit: int = 2
+    optim: str = "adamw_8bit"
+    output_dir: Optional[str] = None
+
+
+class LoraConfig(AppBaseModel):
+    r: int = 16
+    lora_alpha: int = 32
+    lora_dropout: float = 0.0
+    bias: str = "none"
+    use_gradient_checkpointing: str = "unsloth"
+    random_state: int = 3407
+    target_modules: List[str] = Field(default_factory=list)
+
+
+class OutputsConfig(AppBaseModel):
+    base_dir: str
+    logs_dir: Optional[str] = None
+    lora_dir: Optional[str] = None
+    checkpoints_dir: Optional[str] = None
+    metrics_dir: Optional[str] = None
+    merged_dir: Optional[str] = None
+    quantized_dir: Optional[str] = None
+    eval_dir: Optional[str] = None
+    downloads_dir: Optional[str] = None
+
+    @model_validator(mode="after")
+    def fill_defaults(self) -> "OutputsConfig":
+        base = Path(self.base_dir)
+
+        if not self.logs_dir:
+            self.logs_dir = str(base / "logs")
+        if not self.lora_dir:
+            self.lora_dir = str(base / "lora")
+        if not self.checkpoints_dir:
+            self.checkpoints_dir = str(base / "checkpoints")
+        if not self.metrics_dir:
+            self.metrics_dir = str(base / "metrics")
+        if not self.merged_dir:
+            self.merged_dir = str(base / "merged")
+        if not self.quantized_dir:
+            self.quantized_dir = str(base / "quantized")
+        if not self.eval_dir:
+            self.eval_dir = str(base / "evaluation")
+        if not self.downloads_dir:
+            self.downloads_dir = str(base / "downloads")
+
+        return self
+
+
+class PostprocessConfig(AppBaseModel):
+    merge_lora: bool = True
+    save_merged_16bit: bool = True
+    run_awq_quantization: bool = False
+
+
+class AuthConfig(AppBaseModel):
+    bearer_token: Optional[str] = None
+    headers: Dict[str, str] = Field(default_factory=dict)
+
+
+class CallbackConfig(AppBaseModel):
+    enabled: bool = False
+    url: Optional[str] = None
+    timeout_sec: int = 15
+    auth: AuthConfig = Field(default_factory=AuthConfig)
+
+    @property
+    def active(self) -> bool:
+        return self.enabled and bool(self.url)
+
+
+class ReportingConfig(AppBaseModel):
+    status: CallbackConfig = Field(default_factory=CallbackConfig)
+    progress: CallbackConfig = Field(default_factory=CallbackConfig)
+    final: CallbackConfig = Field(default_factory=CallbackConfig)
+    logs: CallbackConfig = Field(default_factory=CallbackConfig)
+
+
+class EvaluationDatasetConfig(AppBaseModel):
+    source: Literal["local", "url"] = "local"
+    path: Optional[str] = None
+    url: Optional[str] = None
+    format: Literal["json", "jsonl"] = "jsonl"
+    question_field: str = "question"
+    answer_field: str = "candidate_answer"
+    score_field: str = "reference_score"
+    max_score_field: Optional[str] = "max_score"
+    tags_field: Optional[str] = "hash_tags"
+
+    @model_validator(mode="after")
+    def validate_source(self) -> "EvaluationDatasetConfig":
+        if self.source == "local" and not self.path:
+            raise ValueError("evaluation.dataset.path is required when source='local'")
+        if self.source == "url" and not self.url:
+            raise ValueError("evaluation.dataset.url is required when source='url'")
+        return self
+
+
+class EvaluationConfig(AppBaseModel):
+    enabled: bool = False
+    target: Literal["auto", "lora", "merged"] = "auto"
+    max_samples: Optional[int] = None
+    max_new_tokens: int = 128
+    temperature: float = 0.0
+    do_sample: bool = False
+    system_prompt: Optional[str] = None
+    prompt_template: str = DEFAULT_EVAL_PROMPT
+    parsing_regex: Optional[str] = None
+    score_min: float = 0.0
+    score_max: float = 5.0
+    dataset: Optional[EvaluationDatasetConfig] = None
+
+    @model_validator(mode="after")
+    def validate_enabled(self) -> "EvaluationConfig":
+        if self.enabled and self.dataset is None:
+            raise ValueError("evaluation.dataset is required when evaluation.enabled=true")
+        return self
+
+
+class UrlArtifactTargets(AppBaseModel):
+    logs_url: Optional[str] = None
+    effective_config_url: Optional[str] = None
+    summary_url: Optional[str] = None
+    train_metrics_url: Optional[str] = None
+    train_history_url: Optional[str] = None
+    eval_summary_url: Optional[str] = None
+    eval_details_url: Optional[str] = None
+    lora_archive_url: Optional[str] = None
+    merged_archive_url: Optional[str] = None
+    full_archive_url: Optional[str] = None
+
+
+class UploadConfig(AppBaseModel):
+    enabled: bool = False
+    target: Literal["local", "huggingface", "url"] = "local"
+    upload_url: Optional[str] = None
+    timeout_sec: int = 120
+    auth: AuthConfig = Field(default_factory=AuthConfig)
+    url_targets: UrlArtifactTargets = Field(default_factory=UrlArtifactTargets)
+
+    repo_id_lora: Optional[str] = None
+    repo_id_merged: Optional[str] = None
+    repo_id_metadata: Optional[str] = None
+    private: bool = True
+    commit_message: str = "trainer-service upload"
+
+
+class HuggingFacePublishConfig(AppBaseModel):
+    enabled: bool = False
+    push_lora: bool = False
+    push_merged: bool = False
+    repo_id_lora: Optional[str] = None
+    repo_id_merged: Optional[str] = None
+    repo_id_metadata: Optional[str] = None
+    private: bool = True
+    commit_message: str = "trainer-service upload"
+    revision: Optional[str] = None
+
+
+class PipelineStage(AppBaseModel):
+    enabled: bool = True
+
+
+class TrainingStage(PipelineStage, TrainingConfig):
+    pass
+
+
+class MergeStage(PipelineStage, PostprocessConfig):
+    pass
+
+
+class EvaluationStage(PipelineStage, EvaluationConfig):
+    pass
+
+
+class PublishStage(PipelineStage, HuggingFacePublishConfig):
+    pass
+
+
+class UploadStage(PipelineStage, UploadConfig):
+    pass
+
+
+class PipelineConfig(AppBaseModel):
+    prepare_assets: PipelineStage = Field(default_factory=PipelineStage)
+    training: TrainingStage = Field(default_factory=TrainingStage)
+    merge: MergeStage = Field(default_factory=MergeStage)
+    evaluation: EvaluationStage = Field(default_factory=EvaluationStage)
+    publish: PublishStage = Field(default_factory=PublishStage)
+    upload: UploadStage = Field(default_factory=UploadStage)
+
+
+class JobConfig(AppBaseModel):
+    job_id: Optional[str] = None
+    job_name: str
+    mode: Literal["local", "remote", "auto"] = "auto"
+
+    model: ModelConfig
+    dataset: DatasetConfig
+    training: TrainingConfig
+    lora: LoraConfig
+    outputs: OutputsConfig
+
+    postprocess: PostprocessConfig = Field(default_factory=PostprocessConfig)
+    evaluation: EvaluationConfig = Field(default_factory=EvaluationConfig)
+    upload: UploadConfig = Field(default_factory=UploadConfig)
+    huggingface: HuggingFacePublishConfig = Field(default_factory=HuggingFacePublishConfig)
+    reporting: ReportingConfig = Field(default_factory=ReportingConfig)
+
+    pipeline: Optional[PipelineConfig] = None
+
+    report_url: Optional[str] = None
+
+
+path: /app/test_remote_flow.py
+----------------------------------------
+import json
+import sys
+import unittest
+from pathlib import Path
+from unittest.mock import MagicMock, mock_open, patch
+
+sys.modules["unsloth"] = MagicMock()
+sys.modules["torch"] = MagicMock()
+sys.modules["datasets"] = MagicMock()
+sys.modules["transformers"] = MagicMock()
+sys.modules["trl"] = MagicMock()
+
+import runner
+from schemas import JobConfig
+
+
+class TestRemoteFlow(unittest.TestCase):
+    def setUp(self):
+        self.config_dict = {
+            "job_id": "job-test-001",
+            "job_name": "test-job",
+            "mode": "remote",
+            "model": {
+                "source": "local",
+                "local_path": "/app",
+                "repo_id": "Qwen/Qwen2.5-7B-Instruct",
+                "base_model": "Qwen/Qwen2.5-7B-Instruct",
+                "base_model_name_or_path": "Qwen/Qwen2.5-7B-Instruct",
+            },
+            "dataset": {
+                "source": "url",
+                "train_url": "http://example.com/train.json",
+                "val_url": "http://example.com/val.json",
+            },
+            "training": {
+                "method": "lora",
+            },
+            "lora": {
+                "target_modules": ["q_proj", "v_proj"],
+            },
+            "outputs": {
+                "base_dir": "test_outputs",
+                "logs_dir": "test_outputs/logs",
+                "lora_dir": "test_outputs/lora",
+                "checkpoints_dir": "test_outputs/checkpoints",
+                "metrics_dir": "test_outputs/metrics",
+                "merged_dir": "test_outputs/merged",
+                "quantized_dir": "test_outputs/quantized",
+                "eval_dir": "test_outputs/evaluation",
+                "downloads_dir": "test_outputs/downloads",
+            },
+            "postprocess": {
+                "merge_lora": True,
+            },
+            "upload": {
+                "enabled": True,
+                "target": "url",
+                "upload_url": "http://example.com/upload",
+                "url_targets": {
+                    "summary_url": "http://example.com/upload/summary",
+                    "logs_url": "http://example.com/upload/logs",
+                    "merged_archive_url": "http://example.com/upload/merged",
+                },
+            },
+            "report_url": "http://example.com/report",
+        }
+        self.cfg = JobConfig.model_validate(self.config_dict)
+
+    @patch("runner.load_config")
+    @patch("runner.Reporter")
+    @patch("runner.AssetManager")
+    @patch("runner.Archiver")
+    @patch("runner.ArtifactUploader")
+    @patch("runner.run_training")
+    @patch("runner.try_hf_login")
+    @patch("runner.setup_logging")
+    @patch("pathlib.Path.open", mock_open())
+    def test_full_pipeline_success(
+        self,
+        mock_path_open,
+        mock_setup_logging,
+        mock_hf_login,
+        mock_run_training,
+        mock_uploader_cls,
+        mock_archiver_cls,
+        mock_asset_manager_cls,
+        mock_reporter_cls,
+        mock_load_config,
+    ):
+        mock_load_config.return_value = self.cfg
+        mock_setup_logging.return_value = Path("test_outputs/logs/trainer.log")
+        mock_run_training.return_value = {
+            "status": "success",
+            "job_name": self.cfg.job_name,
+            "base_model": "/app",
+            "base_model_id": "Qwen/Qwen2.5-7B-Instruct",
+            "base_model_name_or_path": "Qwen/Qwen2.5-7B-Instruct",
+            "lora_dir": "test_outputs/lora/test-job",
+            "merged_dir": "test_outputs/merged/test-job",
+            "checkpoint_dir": "test_outputs/checkpoints/test-job",
+            "metrics_path": "test_outputs/metrics/test-job.train_metrics.json",
+            "history_path": "test_outputs/metrics/test-job.train_history.json",
+            "train_summary_path": "test_outputs/metrics/test-job.train_summary.json",
+            "summary": {"train_loss": 1.23},
+        }
+
+        mock_uploader = mock_uploader_cls.return_value
+        mock_uploader.ensure_hf_ready.return_value = {}
+        mock_uploader.upload_non_summary_artifacts.return_value = (
+            {"logs": {"url": "http://example.com/upload/logs", "path": "trainer.log"}},
+            {},
+        )
+        mock_uploader.upload_to_huggingface.return_value = {}
+        mock_uploader.upload_hf_metadata.return_value = {}
+        mock_uploader.upload_summary.return_value = {
+            "summary": {"url": "http://example.com/upload/summary", "path": "job-result.json"}
+        }
+
+        with patch("sys.argv", ["runner.py", "--config", "http://example.com/config.json"]):
+            runner.main()
+
+        reporter = mock_reporter_cls.return_value
+        reporter.report_status.assert_any_call(
+            "started",
+            message="Training pipeline started",
+            stage="bootstrap",
+            progress=0,
+        )
+        reporter.report_status.assert_any_call(
+            "finished",
+            message="Training pipeline finished successfully",
+            stage="finished",
+            progress=100,
+        )
+        reporter.report_final.assert_called_once()
+
+        mock_asset_manager_cls.return_value.prepare_dataset.assert_called_once_with(self.cfg)
+        mock_asset_manager_cls.return_value.prepare_evaluation_dataset.assert_called_once_with(self.cfg)
+
+        mock_archiver = mock_archiver_cls.return_value
+        mock_archiver.make_archive.assert_called_once()
+        mock_archiver.upload_archive.assert_called_once()
+
+        mock_uploader.upload_non_summary_artifacts.assert_called_once()
+        mock_uploader.upload_summary.assert_called_once()
+
+    @patch("runner.load_config")
+    @patch("runner.Reporter")
+    @patch("runner.AssetManager")
+    @patch("runner.ArtifactUploader")
+    @patch("runner.Archiver")
+    @patch("runner.run_training")
+    @patch("runner.setup_logging")
+    @patch("pathlib.Path.open", mock_open())
+    def test_pipeline_failure(
+        self,
+        mock_path_open,
+        mock_setup_logging,
+        mock_run_training,
+        mock_archiver_cls,
+        mock_uploader_cls,
+        mock_asset_manager_cls,
+        mock_reporter_cls,
+        mock_load_config,
+    ):
+        mock_load_config.return_value = self.cfg
+        mock_setup_logging.return_value = Path("test_outputs/logs/trainer.log")
+        mock_run_training.side_effect = Exception("Training failed")
+
+        with patch("sys.argv", ["runner.py", "--config", "http://example.com/config.json"]):
+            with self.assertRaises(SystemExit) as cm:
+                runner.main()
+
+        self.assertEqual(cm.exception.code, 1)
+        mock_reporter_cls.return_value.report_error.assert_called_once_with(
+            "Training failed",
+            logs=unittest.mock.ANY,
+        )
+
+    @patch("runner.load_config")
+    @patch("runner.Reporter")
+    @patch("runner.AssetManager")
+    @patch("runner.ArtifactUploader")
+    @patch("runner.Archiver")
+    @patch("runner.run_training")
+    @patch("runner.try_hf_login")
+    @patch("runner.setup_logging")
+    @patch("pathlib.Path.open", mock_open())
+    def test_upload_failure_is_not_fatal(
+        self,
+        mock_path_open,
+        mock_setup_logging,
+        mock_hf_login,
+        mock_run_training,
+        mock_archiver_cls,
+        mock_uploader_cls,
+        mock_asset_manager_cls,
+        mock_reporter_cls,
+        mock_load_config,
+    ):
+        mock_load_config.return_value = self.cfg
+        mock_setup_logging.return_value = Path("test_outputs/logs/trainer.log")
+        mock_run_training.return_value = {
+            "status": "success",
+            "job_name": self.cfg.job_name,
+            "base_model": "/app",
+            "base_model_id": "Qwen/Qwen2.5-7B-Instruct",
+            "base_model_name_or_path": "Qwen/Qwen2.5-7B-Instruct",
+            "lora_dir": "test_outputs/lora/test-job",
+            "merged_dir": "test_outputs/merged/test-job",
+            "checkpoint_dir": "test_outputs/checkpoints/test-job",
+            "metrics_path": "test_outputs/metrics/test-job.train_metrics.json",
+            "history_path": "test_outputs/metrics/test-job.train_history.json",
+            "train_summary_path": "test_outputs/metrics/test-job.train_summary.json",
+            "summary": {"train_loss": 1.23},
+        }
+
+        mock_uploader = mock_uploader_cls.return_value
+        mock_uploader.ensure_hf_ready.return_value = {}
+        mock_uploader.upload_non_summary_artifacts.return_value = (
+            {"logs": {"url": "http://example.com/upload/logs", "path": "trainer.log"}},
+            {"merged_archive": "SSL EOF"},
+        )
+        mock_uploader.upload_to_huggingface.return_value = {}
+        mock_uploader.upload_hf_metadata.return_value = {}
+        mock_uploader.upload_summary.return_value = {
+            "summary": {"url": "http://example.com/upload/summary", "path": "job-result.json"}
+        }
+
+        with patch("sys.argv", ["runner.py", "--config", "http://example.com/config.json"]):
+            runner.main()
+
+        reporter = mock_reporter_cls.return_value
+        reporter.report_final.assert_called_once()
+        final_call = reporter.report_final.call_args
+        final_payload = final_call.args[0]
+
+        self.assertEqual(final_call.kwargs["status"], "finished")
+        self.assertEqual(final_payload["status"], "success")
+        self.assertIn("merged_archive", final_payload["upload_errors"])
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+path: /app/train_runner.py
+----------------------------------------
+from __future__ import annotations
+
+import inspect
+import json
+import logging
+import math
+import os
+from pathlib import Path
+from typing import Any, Dict, Optional
+
+os.environ["WANDB_DISABLED"] = "true"
+
+import unsloth
+from unsloth import FastLanguageModel
+
+import torch
+from datasets import load_dataset
+from transformers import TrainerCallback, TrainingArguments
+from trl import SFTTrainer
+
+from reporter import Reporter
+from schemas import JobConfig
+
+logger = logging.getLogger(__name__)
+
+
+def ensure_dirs(cfg: JobConfig) -> None:
+    for path in [
+        cfg.outputs.base_dir,
+        cfg.outputs.logs_dir,
+        cfg.outputs.lora_dir,
+        cfg.outputs.checkpoints_dir,
+        cfg.outputs.metrics_dir,
+        cfg.outputs.merged_dir,
+        cfg.outputs.quantized_dir,
+        cfg.outputs.eval_dir,
+        cfg.outputs.downloads_dir,
+    ]:
+        Path(path).mkdir(parents=True, exist_ok=True)
+
+
+def resolve_model_args(cfg: JobConfig) -> tuple[str, bool, Optional[str]]:
+    if cfg.model.source == "local":
+        model_name = cfg.model.local_path
+    else:
+        model_name = cfg.model.repo_id
+
+    if not model_name:
+        raise ValueError("Model path/repo_id is empty")
+
+    load_in_4bit = (
+        bool(cfg.model.load_in_4bit)
+        if cfg.model.load_in_4bit is not None
+        else (cfg.training.method == "qlora")
+    )
+
+    logical_base_model_id = cfg.model.logical_base_model_id
+
+    return model_name, load_in_4bit, logical_base_model_id
+
+
+def safe_float(value: Any) -> Optional[float]:
+    try:
+        parsed = float(value)
+        if math.isfinite(parsed):
+            return parsed
+    except Exception:
+        pass
+    return None
+
+
+def build_text_from_messages(messages: list[dict], tokenizer) -> str:
+    try:
+        return tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=False,
+        )
+    except Exception:
+        parts = []
+        for msg in messages:
+            role = msg.get("role", "user")
+            content = msg.get("content", "")
+            parts.append(f"{role.upper()}: {content}")
+        return "\n".join(parts)
+
+
+def format_example(example: Dict[str, Any], cfg: JobConfig, tokenizer) -> Dict[str, str]:
+    if cfg.dataset.format == "instruction_output":
+        input_value = str(example.get(cfg.dataset.input_field, "") or "").strip()
+        output_value = str(example.get(cfg.dataset.output_field, "") or "").strip()
+        text = (
+            f"### Instruction:\n{input_value}\n\n"
+            f"### Response:\n{output_value}{tokenizer.eos_token}"
+        )
+        return {"text": text}
+
+    if cfg.dataset.format == "prompt_completion":
+        prompt_value = str(example.get(cfg.dataset.input_field, "") or "").strip()
+        completion_value = str(example.get(cfg.dataset.output_field, "") or "").strip()
+        text = f"{prompt_value}{completion_value}{tokenizer.eos_token}"
+        return {"text": text}
+
+    if cfg.dataset.format == "messages":
+        messages = example.get(cfg.dataset.messages_field) or example.get("messages") or []
+        if not isinstance(messages, list):
+            return {"text": ""}
+        text = build_text_from_messages(messages, tokenizer)
+        if tokenizer.eos_token and not text.endswith(tokenizer.eos_token):
+            text = f"{text}{tokenizer.eos_token}"
+        return {"text": text}
+
+    raise ValueError(f"Unsupported dataset format: {cfg.dataset.format}")
+
+
+class TrainingProgressCallback(TrainerCallback):
+    def __init__(self, reporter: Optional[Reporter]):
+        self.reporter = reporter
+
+    def on_train_begin(self, args, state, control, **kwargs):
+        if not self.reporter:
+            return
+        self.reporter.report_status(
+            "running",
+            stage="training",
+            progress=0,
+            message="training started",
+            extra={"max_steps": int(state.max_steps or 0)},
+        )
+
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if not self.reporter or not logs:
+            return
+
+        max_steps = int(state.max_steps or 0)
+        progress = round((int(state.global_step) / max_steps) * 100, 2) if max_steps > 0 else None
+
+        payload = {
+            "step": int(state.global_step),
+            "epoch": safe_float(state.epoch),
+            **logs,
+        }
+
+        self.reporter.report_progress(
+            stage="training",
+            progress=progress,
+            message="trainer log",
+            extra=payload,
+        )
+
+    def on_save(self, args, state, control, **kwargs):
+        if not self.reporter:
+            return
+
+        max_steps = int(state.max_steps or 0)
+        progress = round((int(state.global_step) / max_steps) * 100, 2) if max_steps > 0 else None
+
+        self.reporter.report_progress(
+            stage="training",
+            progress=progress,
+            message="checkpoint saved",
+            extra={"step": int(state.global_step)},
+        )
+
+    def on_train_end(self, args, state, control, **kwargs):
+        if not self.reporter:
+            return
+        self.reporter.report_status(
+            "running",
+            stage="training",
+            progress=100,
+            message="training finished",
+            extra={"step": int(state.global_step)},
+        )
+
+
+def _build_training_args(cfg: JobConfig, checkpoint_dir: str, has_validation: bool) -> TrainingArguments:
+    common_kwargs = {
+        "output_dir": checkpoint_dir,
+        "per_device_train_batch_size": cfg.training.per_device_train_batch_size,
+        "gradient_accumulation_steps": cfg.training.gradient_accumulation_steps,
+        "warmup_ratio": cfg.training.warmup_ratio,
+        "num_train_epochs": cfg.training.num_train_epochs,
+        "learning_rate": cfg.training.learning_rate,
+        "bf16": cfg.training.bf16,
+        "fp16": not cfg.training.bf16,
+        "logging_steps": cfg.training.logging_steps,
+        "save_steps": cfg.training.save_steps,
+        "save_strategy": "steps",
+        "save_total_limit": cfg.training.save_total_limit,
+        "optim": cfg.training.optim,
+        "report_to": [],
+        "push_to_hub": False,
+        "logging_dir": cfg.outputs.logs_dir,
+    }
+
+    sig = inspect.signature(TrainingArguments.__init__)
+    supported = set(sig.parameters.keys())
+
+    filtered_kwargs = {k: v for k, v in common_kwargs.items() if k in supported}
+
+    if has_validation:
+        if "eval_steps" in supported:
+            filtered_kwargs["eval_steps"] = cfg.training.eval_steps
+
+        if "eval_strategy" in supported:
+            filtered_kwargs["eval_strategy"] = "steps"
+        elif "evaluation_strategy" in supported:
+            filtered_kwargs["evaluation_strategy"] = "steps"
+    else:
+        if "eval_strategy" in supported:
+            filtered_kwargs["eval_strategy"] = "no"
+        elif "evaluation_strategy" in supported:
+            filtered_kwargs["evaluation_strategy"] = "no"
+
+    if "save_safetensors" in supported:
+        filtered_kwargs["save_safetensors"] = True
+
+    return TrainingArguments(**filtered_kwargs)
+
+
+def _build_sft_trainer(
+    cfg: JobConfig,
+    model,
+    tokenizer,
+    train_dataset,
+    eval_dataset,
+    training_args: TrainingArguments,
+):
+    sig = inspect.signature(SFTTrainer.__init__)
+    supported = set(sig.parameters.keys())
+
+    kwargs = {
+        "model": model,
+        "args": training_args,
+        "train_dataset": train_dataset,
+    }
+
+    if eval_dataset is not None and "eval_dataset" in supported:
+        kwargs["eval_dataset"] = eval_dataset
+
+    if "processing_class" in supported:
+        kwargs["processing_class"] = tokenizer
+    elif "tokenizer" in supported:
+        kwargs["tokenizer"] = tokenizer
+
+    if "dataset_text_field" in supported:
+        kwargs["dataset_text_field"] = "text"
+
+    if "packing" in supported:
+        kwargs["packing"] = cfg.training.packing
+
+    if "max_seq_length" in supported:
+        kwargs["max_seq_length"] = cfg.training.max_seq_length
+
+    return SFTTrainer(**kwargs)
+
+
+def run_training(cfg: JobConfig, reporter: Optional[Reporter] = None) -> dict:
+    ensure_dirs(cfg)
+
+    model_name, load_in_4bit, logical_base_model_id = resolve_model_args(cfg)
+
+    logger.info("==> loading model: %s", model_name)
+    if logical_base_model_id:
+        logger.info("==> logical base model id: %s", logical_base_model_id)
+    logger.info("==> method: %s", cfg.training.method)
+
+    if reporter:
+        reporter.report_status(
+            "running",
+            stage="load_model",
+            progress=5,
+            message="loading base model",
+            extra={
+                "model_name": model_name,
+                "logical_base_model_id": logical_base_model_id,
+                "load_in_4bit": load_in_4bit,
+                "dtype": cfg.model.dtype,
+            },
+        )
+
+    model, tokenizer = FastLanguageModel.from_pretrained(
+        model_name=model_name,
+        max_seq_length=cfg.training.max_seq_length or cfg.model.max_seq_length,
+        dtype=torch.bfloat16 if cfg.training.bf16 else None,
+        load_in_4bit=load_in_4bit,
+        local_files_only=(cfg.model.source == "local"),
+        trust_remote_code=cfg.model.trust_remote_code,
+        device_map="auto",
+    )
+
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    model = FastLanguageModel.get_peft_model(
+        model,
+        r=cfg.lora.r,
+        target_modules=cfg.lora.target_modules,
+        lora_alpha=cfg.lora.lora_alpha,
+        lora_dropout=cfg.lora.lora_dropout,
+        bias=cfg.lora.bias,
+        use_gradient_checkpointing=cfg.lora.use_gradient_checkpointing,
+        random_state=cfg.lora.random_state,
+    )
+
+    if not cfg.dataset.train_path:
+        raise ValueError("dataset.train_path is required for training")
+
+    if reporter:
+        reporter.report_status(
+            "running",
+            stage="load_dataset",
+            progress=15,
+            message="loading dataset",
+        )
+
+    data_files = {"train": cfg.dataset.train_path}
+    if cfg.dataset.val_path:
+        data_files["validation"] = cfg.dataset.val_path
+
+    dataset = load_dataset("json", data_files=data_files)
+
+    dataset = dataset.map(
+        lambda example: format_example(example, cfg, tokenizer),
+        desc="Formatting dataset",
+    )
+    dataset = dataset.filter(
+        lambda row: bool(str(row.get("text", "")).strip()),
+        desc="Filtering empty rows",
+    )
+
+    if len(dataset["train"]) == 0:
+        raise ValueError("Train dataset is empty after formatting/filtering")
+
+    checkpoint_dir = str(Path(cfg.outputs.checkpoints_dir) / cfg.job_name)
+    Path(checkpoint_dir).mkdir(parents=True, exist_ok=True)
+
+    training_args = _build_training_args(
+        cfg=cfg,
+        checkpoint_dir=checkpoint_dir,
+        has_validation="validation" in dataset,
+    )
+
+    trainer = _build_sft_trainer(
+        cfg=cfg,
+        model=model,
+        tokenizer=tokenizer,
+        train_dataset=dataset["train"],
+        eval_dataset=dataset["validation"] if "validation" in dataset else None,
+        training_args=training_args,
+    )
+
+    trainer.add_callback(TrainingProgressCallback(reporter))
+
+    logger.info("==> training started")
+    train_result = trainer.train()
+    logger.info("==> training finished")
+
+    lora_dir = Path(cfg.outputs.lora_dir) / cfg.job_name
+    merged_dir = Path(cfg.outputs.merged_dir) / cfg.job_name
+    metrics_path = Path(cfg.outputs.metrics_dir) / f"{cfg.job_name}.train_metrics.json"
+    history_path = Path(cfg.outputs.metrics_dir) / f"{cfg.job_name}.train_history.json"
+    train_summary_path = Path(cfg.outputs.metrics_dir) / f"{cfg.job_name}.train_summary.json"
+
+    lora_dir.mkdir(parents=True, exist_ok=True)
+    merged_dir.mkdir(parents=True, exist_ok=True)
+
+    if reporter:
+        reporter.report_status(
+            "running",
+            stage="save_lora",
+            progress=92,
+            message="saving lora adapters",
+            extra={"path": str(lora_dir)},
+        )
+
+    logger.info("==> saving lora adapters to %s", lora_dir)
+    model.save_pretrained(str(lora_dir))
+    tokenizer.save_pretrained(str(lora_dir))
+
+    merged_saved = False
+    if cfg.postprocess.merge_lora and cfg.postprocess.save_merged_16bit:
+        if reporter:
+            reporter.report_status(
+                "running",
+                stage="merge_lora",
+                progress=96,
+                message="saving merged model",
+                extra={"path": str(merged_dir)},
+            )
+
+        logger.info("==> saving merged model to %s", merged_dir)
+        model.save_pretrained_merged(
+            save_directory=str(merged_dir),
+            tokenizer=tokenizer,
+            save_method="merged_16bit",
+        )
+        merged_saved = True
+
+    metrics = dict(train_result.metrics)
+    history = trainer.state.log_history
+
+    final_loss = None
+    for entry in reversed(history):
+        if "loss" in entry:
+            final_loss = entry["loss"]
+            break
+
+    train_summary = {
+        "job_name": cfg.job_name,
+        "train_rows": len(dataset["train"]),
+        "validation_rows": len(dataset["validation"]) if "validation" in dataset else 0,
+        "method": cfg.training.method,
+        "base_model": model_name,
+        "base_model_id": logical_base_model_id,
+        "base_model_name_or_path": logical_base_model_id,
+        "load_in_4bit": load_in_4bit,
+        "bf16": cfg.training.bf16,
+        "merged_saved": merged_saved,
+        "train_runtime": metrics.get("train_runtime"),
+        "train_samples_per_second": metrics.get("train_samples_per_second"),
+        "train_steps_per_second": metrics.get("train_steps_per_second"),
+        "train_loss": metrics.get("train_loss"),
+        "final_loss": final_loss,
+    }
+
+    with metrics_path.open("w", encoding="utf-8") as f:
+        json.dump(metrics, f, indent=2, ensure_ascii=False)
+
+    with history_path.open("w", encoding="utf-8") as f:
+        json.dump(history, f, indent=2, ensure_ascii=False)
+
+    with train_summary_path.open("w", encoding="utf-8") as f:
+        json.dump(train_summary, f, indent=2, ensure_ascii=False)
+
+    logger.info("==> training artifacts saved")
+
+    if reporter:
+        reporter.report_status(
+            "running",
+            stage="train_completed",
+            progress=100,
+            message="training stage completed",
+            extra=train_summary,
+        )
+
+    try:
+        del trainer
+    except Exception:
+        pass
+
+    try:
+        torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+    return {
+        "status": "success",
+        "job_name": cfg.job_name,
+        "base_model": model_name,
+        "base_model_id": logical_base_model_id,
+        "base_model_name_or_path": logical_base_model_id,
+        "lora_dir": str(lora_dir),
+        "merged_dir": str(merged_dir) if merged_saved else None,
+        "checkpoint_dir": checkpoint_dir,
+        "metrics_path": str(metrics_path),
+        "history_path": str(history_path),
+        "train_summary_path": str(train_summary_path),
+        "summary": train_summary,
+    }
+
+
+path: /bundle-code.js
+----------------------------------------
+#!/usr/bin/env node
+/**
+ * bundle-code.js
+ * Собирает весь текстовый код проекта в один файл, помечая секции путями.
+ * - Рекурсивный обход
+ * - Пропуск бинарных файлов (по содержимому)
+ * - Игнор по .codebundleignore (gitignore-like)
+ */
+
+const  fs = require("fs");
+const  fsp = require("fs/promises");
+const  path = require("path")
+
+const PROJECT_ROOT = process.cwd();
+const IGNORE_FILE_NAME = ".codebun)dleignore";
+const OUTPUT_FILE = path.join(PROJECT_ROOT, "codebundle.txt");
+
+const MAX_FILE_SIZE_BYTES = 5 * 1024 * 1024; // 5MB
+const MAX_TOTAL_BYTES = 200 * 1024 * 1024;   // 200MB
+
+// Если заполнить — соберёт только эти расширения. Если пусто — любые текстовые.
+const ONLY_EXTENSIONS = new Set([
+  // ".js", ".jsx", ".ts", ".tsx", ".json", ".css", ".scss", ".md", ".html", ".yml", ".yaml"
+]);
+
+function normalizeToPosix(p) {
+  return p.split(path.sep).join("/");
+}
+
+function stripBom(s) {
+  return s.charCodeAt(0) === 0xfeff ? s.slice(1) : s;
+}
+
+async function readIgnoreFile(ignorePath) {
+  try {
+    const raw = await fsp.readFile(ignorePath, "utf8");
+    return stripBom(raw)
+      .split(/\r?\n/)
+      .map(l => l.trim())
+      .filter(l => l && !l.startsWith("#"));
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Компилируем игнор-правила.
+ * Поддержка:
+ * - "node_modules/" (игнор любой сегмент /node_modules/ в любом месте)
+ * - "dist/" и т.п.
+ * - "*.ext"
+ * - "path/to/file" (точный относительный путь)
+ * - "!pattern" (снять игнор)
+ */
+function buildIgnoreMatcher(patterns) {
+  // дефолтные, чтобы не протекало даже если забыли
+  const defaultPatterns = [
+    "node_modules/",
+    ".git/",
+    "dist/",
+    "build/",
+    ".next/",
+    "coverage/",
+    "package-lock.json",
+    "yarn.lock",
+    "pnpm-lock.yaml",
+  ];
+
+  const all = [...defaultPatterns, ...patterns];
+
+  const rules = all.map(p => ({
+    neg: p.startsWith("!"),
+    pat: (p.startsWith("!") ? p.slice(1) : p).trim(),
+  })).filter(r => r.pat);
+
+  function matchRule(relPosix, pat) {
+    // relPosix: "admin/node_modules/express/index.js"
+
+    // directory pattern: "node_modules/"
+    if (pat.endsWith("/")) {
+      const seg = pat.slice(0, -1);
+      if (!seg) return false;
+
+      // матч:
+      // - если путь начинается с seg/
+      // - или содержит /seg/ как сегмент
+      return (
+        relPosix === seg ||
+        relPosix.startsWith(seg + "/") ||
+        relPosix.includes("/" + seg + "/") ||
+        relPosix.endsWith("/" + seg)
+      );
+    }
+
+    // glob extension: "*.png"
+    if (pat.startsWith("*.") && !pat.includes("/")) {
+      const ext = pat.slice(1); // ".png"
+      return relPosix.toLowerCase().endsWith(ext.toLowerCase());
+    }
+
+    // exact file path
+    return relPosix === pat;
+  }
+
+  return function isIgnored(relPosix) {
+    let ignored = false;
+    for (const r of rules) {
+      if (matchRule(relPosix, r.pat)) {
+        ignored = !r.neg; // если negation — снимаем игнор
+      }
+    }
+    return ignored;
+  };
+}
+
+async function isProbablyBinary(filePath) {
+  const fd = await fsp.open(filePath, "r");
+  try {
+    const { size } = await fd.stat();
+    const toRead = Math.min(size, 8192);
+    const buf = Buffer.allocUnsafe(toRead);
+    const { bytesRead } = await fd.read(buf, 0, toRead, 0);
+    if (bytesRead === 0) return false;
+
+    let nulCount = 0;
+    let weirdCount = 0;
+    for (let i = 0; i < bytesRead; i++) {
+      const b = buf[i];
+      if (b === 0) nulCount++;
+      const ok =
+        b === 9 || b === 10 || b === 13 || (b >= 32 && b <= 126) || b >= 128;
+      if (!ok) weirdCount++;
+    }
+    if (nulCount > 0) return true;
+    return (weirdCount / bytesRead) > 0.25;
+  } finally {
+    await fd.close();
+  }
+}
+
+async function* walk(dirAbs, isIgnored) {
+  let entries;
+  try {
+    entries = await fsp.readdir(dirAbs, { withFileTypes: true });
+  } catch {
+    return;
+  }
+
+  entries.sort((a, b) => a.name.localeCompare(b.name));
+
+  for (const ent of entries) {
+    const abs = path.join(dirAbs, ent.name);
+    const rel = path.relative(PROJECT_ROOT, abs);
+    const relPosix = normalizeToPosix(rel);
+
+    // не включаем output и ignore файл
+    if (path.resolve(abs) === path.resolve(OUTPUT_FILE)) continue;
+    if (relPosix === IGNORE_FILE_NAME) continue;
+
+    if (isIgnored(relPosix)) continue;
+
+    if (ent.isDirectory()) {
+      yield* walk(abs, isIgnored);
+    } else if (ent.isFile()) {
+      yield { abs, relPosix };
+    }
+  }
+}
+
+async function bundle() {
+  const ignorePath = path.join(PROJECT_ROOT, IGNORE_FILE_NAME);
+  const patterns = await readIgnoreFile(ignorePath);
+  const isIgnored = buildIgnoreMatcher(patterns);
+
+  const out = fs.createWriteStream(OUTPUT_FILE, { encoding: "utf8" });
+
+  let totalBytes = 0;
+  let included = 0;
+  let skippedBinary = 0;
+  let skippedSize = 0;
+  let skippedExt = 0;
+
+  out.write(`=== CODE BUNDLE ===\n`);
+  out.write(`root: ${normalizeToPosix(PROJECT_ROOT)}\n`);
+  out.write(`ignore: ${IGNORE_FILE_NAME}\n`);
+  out.write(`generated: ${new Date().toISOString()}\n\n`);
+
+  for await (const file of walk(PROJECT_ROOT, isIgnored)) {
+    const ext = path.extname(file.relPosix).toLowerCase();
+    if (ONLY_EXTENSIONS.size && !ONLY_EXTENSIONS.has(ext)) {
+      skippedExt++;
+      continue;
+    }
+
+    let stat;
+    try {
+      stat = await fsp.stat(file.abs);
+    } catch {
+      continue;
+    }
+
+    if (stat.size > MAX_FILE_SIZE_BYTES) {
+      skippedSize++;
+      continue;
+    }
+    if (totalBytes + stat.size > MAX_TOTAL_BYTES) {
+      out.write(`\n\n=== STOP: total size limit reached (${MAX_TOTAL_BYTES} bytes) ===\n`);
+      break;
+    }
+
+    let binary;
+    try {
+      binary = await isProbablyBinary(file.abs);
+    } catch {
+      continue;
+    }
+    if (binary) {
+      skippedBinary++;
+      continue;
+    }
+
+    let content;
+    try {
+      content = await fsp.readFile(file.abs, "utf8");
+    } catch {
+      continue;
+    }
+
+    out.write(`\n\npath: /${file.relPosix}\n`);
+    out.write(`----------------------------------------\n`);
+    out.write(content);
+    if (!content.endsWith("\n")) out.write("\n");
+
+    totalBytes += stat.size;
+    included++;
+  }
+
+  out.write(`\n\n=== SUMMARY ===\n`);
+  out.write(`included: ${included}\n`);
+  out.write(`skipped(binary): ${skippedBinary}\n`);
+  out.write(`skipped(size): ${skippedSize}\n`);
+  out.write(`skipped(ext): ${skippedExt}\n`);
+  out.write(`totalBytes(approx): ${totalBytes}\n`);
+
+  await new Promise((res, rej) => {
+    out.end(res);
+    out.on("error", rej);
+  });
+
+  console.log(`Done. Output: ${OUTPUT_FILE}`);
+}
+
+bundle().catch(err => {
+  console.error("Error:", err);
+  process.exitCode = 1;
+});
+
+
+path: /docker/Dockerfile
+----------------------------------------
+ARG BASE_IMAGE=igortet/model-qwen-7b
+FROM ${BASE_IMAGE}
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PIP_NO_CACHE_DIR=1 \
+    PYTHONUNBUFFERED=1 \
+    VIRTUAL_ENV=/opt/venv \
+    PATH="/opt/venv/bin:$PATH" \
+    HF_HOME=/cache/huggingface \
+    TRANSFORMERS_CACHE=/cache/huggingface \
+    HUGGINGFACE_HUB_CACHE=/cache/huggingface \
+    HF_HUB_DISABLE_TELEMETRY=1
+
+RUN apt-get update && apt-get install -y \
+    python3 \
+    python3-pip \
+    python3-venv \
+    git \
+    curl \
+    bash \
+    ca-certificates \
+    libgomp1 \
+    libstdc++6 \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN python3 -m venv /opt/venv
+
+WORKDIR /trainer
+
+# Копируем все предварительно скачанные wheel-файлы
+COPY packages/pip /wheels/pip
+COPY requirements.txt /trainer/requirements.txt
+
+RUN pip install -U pip setuptools wheel
+
+# Устанавливаем только те пакеты, которые указаны в requirements.txt,
+# используя локальные колёса (--find-links) и без обращения в интернет (--no-index).
+# Pip сам разрешит и установит все необходимые зависимости (включая транзитивные,
+# такие как urllib3, idna и т.д.) из папки /wheels/pip.
+RUN pip install -r /trainer/requirements.txt --no-index --find-links /wheels/pip --break-system-packages
+
+COPY app /trainer/app
+COPY docker/entrypoint.sh /trainer/entrypoint.sh
+
+RUN chmod +x /trainer/entrypoint.sh && \
+    mkdir -p /output /cache/huggingface
+
+ENTRYPOINT ["/trainer/entrypoint.sh"]
+
+
+path: /docker/entrypoint.sh
+----------------------------------------
+#!/usr/bin/env bash
+set -euo pipefail
+
+DEFAULT_LOCAL_CONFIG="/configs/job.local.json"
+
+echo "==> trainer-service starting"
+
+if [ "$#" -gt 0 ]; then
+  echo "==> launching with explicit CLI args: $*"
+  exec python /trainer/app/runner.py "$@"
+fi
+
+if [ -n "${JOB_CONFIG_URL:-}" ]; then
+  echo "==> remote bootstrap via JOB_CONFIG_URL"
+  echo "==> job config url: ${JOB_CONFIG_URL}"
+  exec python /trainer/app/runner.py --job-config-url "${JOB_CONFIG_URL}"
+fi
+
+CONFIG_SOURCE="${CONFIG_SOURCE:-local}"
+CONFIG_REF="${CONFIG_REF:-}"
+
+if [ -n "${CONFIG_PATH:-}" ]; then
+  CONFIG_REF="$CONFIG_PATH"
+  CONFIG_SOURCE="local"
+fi
+
+echo "==> config source: ${CONFIG_SOURCE}"
+echo "==> config ref: ${CONFIG_REF:-<empty>}"
+echo "==> model path in image assumed at: /app"
+
+if [ "${CONFIG_SOURCE}" = "remote" ]; then
+  if [ -z "${CONFIG_REF}" ]; then
+    echo "ERROR: CONFIG_REF is required when CONFIG_SOURCE=remote"
+    exit 1
+  fi
+
+  exec python /trainer/app/runner.py --config "${CONFIG_REF}"
+fi
+
+if [ -z "${CONFIG_REF}" ]; then
+  CONFIG_REF="${DEFAULT_LOCAL_CONFIG}"
+fi
+
+if [ ! -f "${CONFIG_REF}" ]; then
+  echo "ERROR: local config file not found: ${CONFIG_REF}"
+  exit 1
+fi
+
+exec python /trainer/app/runner.py --config "${CONFIG_REF}"
+
+
+path: /docker-compose.local.yml
+----------------------------------------
+services:
+  itk-ai-trainer-service:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    image: itk-ai-trainer-service
+    env_file:
+      - .env.local.example
+    volumes:
+      - ./examples:/configs
+      - ./data:/data
+      - ./output:/output
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+
+path: /docker-compose.remote.yml
+----------------------------------------
+services:
+  itk-ai-trainer-service:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    image: itk-ai-trainer-service:qwen-7b
+    env_file:
+      - .env.remote.example
+    environment:
+      HF_TOKEN: ${HF_TOKEN:-}
+    volumes:
+      - ./output:/output
+    gpus: all
+    shm_size: "16gb"
+    restart: "no"
+
+
+path: /docs/api_contract.md
+----------------------------------------
+## 1. Callback: status
+
+Используется для крупных смен стадий:
+
+* started
+* running
+* finished
+* failed
+
+### Endpoint
+
+`POST /api/jobs/status`
+
+### Тело запроса
+
+```json
+{
+  "job_id": "job_qwen25_05b_demo_remote",
+  "job_name": "qwen25-05b-demo-remote",
+  "event": "status",
+  "timestamp": 1773926400.123,
+  "status": "running",
+  "stage": "prepare_assets",
+  "progress": 5,
+  "message": "Preparing datasets and remote assets",
+  "logs": null,
+  "extra": {}
+}
+```
+
+### Поля
+
+```json
+{
+  "job_id": "string",
+  "job_name": "string",
+  "event": "status",
+  "timestamp": "number (unix seconds)",
+  "status": "started | running | finished | failed",
+  "stage": "string | null",
+  "progress": "number 0..100 | null",
+  "message": "string | null",
+  "logs": "string | null",
+  "extra": "object"
+}
+```
+
+### Что backend должен делать
+
+* находить job по `job_id`
+* обновлять:
+
+  * общий статус
+  * текущую стадию
+  * progress
+  * last_message
+  * updated_at
+* если `status=failed`, сохранить `logs` как diagnostic tail
+
+### Ответ
+
+```json
+{
+  "ok": true
+}
+```
+
+---
+
+## 2. Callback: progress
+
+Используется часто, для живого прогресса во время train/eval.
+
+### Endpoint
+
+`POST /api/jobs/progress`
+
+### Тело запроса
+
+```json
+{
+  "job_id": "job_qwen25_05b_demo_remote",
+  "job_name": "qwen25-05b-demo-remote",
+  "event": "progress",
+  "timestamp": 1773926412.456,
+  "status": "running",
+  "stage": "training",
+  "progress": 37.5,
+  "message": "trainer log",
+  "extra": {
+    "step": 120,
+    "epoch": 0.42,
+    "loss": 1.1834,
+    "grad_norm": 0.91,
+    "learning_rate": 0.000082
+  }
+}
+```
+
+### Поля
+
+```json
+{
+  "job_id": "string",
+  "job_name": "string",
+  "event": "progress",
+  "timestamp": "number",
+  "status": "running",
+  "stage": "string",
+  "progress": "number 0..100 | null",
+  "message": "string | null",
+  "extra": "object"
+}
+```
+
+### Что backend должен делать
+
+* обновлять live progress
+* писать историю progress events в отдельную таблицу или log stream
+* по желанию агрегировать последние train metrics в UI
+
+---
+
+## 3. Callback: final
+
+Финальный результат job целиком.
+
+### Endpoint
+
+`POST /api/jobs/final`
+
+### Тело запроса при успехе
+
+```json
+{
+  "job_id": "job_qwen25_05b_demo_remote",
+  "job_name": "qwen25-05b-demo-remote",
+  "event": "final",
+  "timestamp": 1773926999.111,
+  "status": "finished",
+  "result": {
+    "status": "success",
+    "job_id": "job_qwen25_05b_demo_remote",
+    "job_name": "qwen25-05b-demo-remote",
+    "started_at": "2026-03-19T13:00:00+00:00",
+    "finished_at": "2026-03-19T13:09:59+00:00",
+    "config_source": "https://example.com/job.json",
+    "training": {
+      "status": "success",
+      "job_name": "qwen25-05b-demo-remote",
+      "base_model": "/models/qwen25-05b",
+      "lora_dir": "/output/qwen25-05b-demo-remote/lora/qwen25-05b-demo-remote",
+      "merged_dir": "/output/qwen25-05b-demo-remote/merged/qwen25-05b-demo-remote",
+      "checkpoint_dir": "/output/qwen25-05b-demo-remote/checkpoints/qwen25-05b-demo-remote",
+      "metrics_path": "/output/qwen25-05b-demo-remote/metrics/qwen25-05b-demo-remote.train_metrics.json",
+      "history_path": "/output/qwen25-05b-demo-remote/metrics/qwen25-05b-demo-remote.train_history.json",
+      "train_summary_path": "/output/qwen25-05b-demo-remote/metrics/qwen25-05b-demo-remote.train_summary.json",
+      "summary": {
+        "job_name": "qwen25-05b-demo-remote",
+        "train_rows": 10000,
+        "validation_rows": 500,
+        "method": "qlora",
+        "base_model": "/models/qwen25-05b",
+        "load_in_4bit": true,
+        "bf16": true,
+        "merged_saved": true,
+        "train_runtime": 522.4,
+        "train_samples_per_second": 19.1,
+        "train_steps_per_second": 0.52,
+        "train_loss": 0.947,
+        "final_loss": 0.913
+      }
+    },
+    "evaluation": {
+      "enabled": true,
+      "target": "auto",
+      "model": "/output/qwen25-05b-demo-remote/merged/qwen25-05b-demo-remote",
+      "summary": {
+        "model": "/output/qwen25-05b-demo-remote/merged/qwen25-05b-demo-remote",
+        "samples": 100,
+        "parseSuccessRate": 0.96,
+        "mae": 0.41,
+        "rmse": 0.67,
+        "exactRate": 0.58,
+        "within1Rate": 0.95,
+        "within2Rate": 1.0,
+        "meanSignedError": -0.08,
+        "avgPredictedScore": 3.82,
+        "parseErrors": 4,
+        "inferenceErrors": 0,
+        "emptyResponses": 1
+      },
+      "summary_json_path": "/output/qwen25-05b-demo-remote/evaluation/qwen25-05b-demo-remote/summary.json",
+      "result_json_path": "/output/qwen25-05b-demo-remote/evaluation/qwen25-05b-demo-remote/result.json",
+      "summary_csv_path": "/output/qwen25-05b-demo-remote/evaluation/qwen25-05b-demo-remote/summary.csv",
+      "detailed_csv_path": "/output/qwen25-05b-demo-remote/evaluation/qwen25-05b-demo-remote/detailed.csv"
+    },
+    "artifacts": {
+      "log_file": "/output/qwen25-05b-demo-remote/logs/trainer.log",
+      "effective_config_path": "/output/qwen25-05b-demo-remote/logs/effective-job.json",
+      "result_path": "/output/qwen25-05b-demo-remote/job-result.json"
+    },
+    "uploads": {
+      "logs": {
+        "url": "https://example.com/api/jobs/upload/logs",
+        "path": "/output/qwen25-05b-demo-remote/logs/trainer.log"
+      },
+      "lora_archive": {
+        "url": "https://example.com/api/jobs/upload/lora",
+        "archive_path": "/output/qwen25-05b-demo-remote/qwen25-05b-demo-remote.lora.tar.gz"
+      }
+    }
+  }
+}
+```
+
+### Тело запроса при ошибке
+
+```json
+{
+  "job_id": "job_qwen25_05b_demo_remote",
+  "job_name": "qwen25-05b-demo-remote",
+  "event": "final",
+  "timestamp": 1773926999.111,
+  "status": "failed",
+  "result": {
+    "status": "failed",
+    "job_id": "job_qwen25_05b_demo_remote",
+    "job_name": "qwen25-05b-demo-remote",
+    "started_at": "2026-03-19T13:00:00+00:00",
+    "finished_at": "2026-03-19T13:02:11+00:00",
+    "config_source": "https://example.com/job.json",
+    "error": "Evaluation dataset is empty after normalization",
+    "artifacts": {
+      "log_file": "/output/qwen25-05b-demo-remote/logs/trainer.log",
+      "effective_config_path": "/output/qwen25-05b-demo-remote/logs/effective-job.json",
+      "result_path": "/output/qwen25-05b-demo-remote/job-result.json"
+    }
+  }
+}
+```
+
+### Что backend должен делать
+
+* помечать job завершённым
+* сохранять итоговый payload целиком
+* разбирать `training.summary`
+* разбирать `evaluation.summary`
+* связывать загруженные артефакты с job
+
+---
+
+## 4. Upload endpoints
+
+Runner отправляет файлы multipart/form-data.
+
+### Общий формат upload request
+
+`POST /api/jobs/upload/<artifact-type>`
+
+`Content-Type: multipart/form-data`
+
+Поля формы:
+
+* `job_id`
+* `job_name`
+* `artifact_type`
+* `file`
+
+### Пример
+
+Поле `file` содержит бинарник файла или tar.gz.
+
+### Универсальный ответ
+
+```json
+{
+  "ok": true,
+  "artifact_id": "art_123",
+  "job_id": "job_qwen25_05b_demo_remote",
+  "artifact_type": "lora_archive",
+  "storage_key": "jobs/job_qwen25_05b_demo_remote/lora.tar.gz",
+  "download_url": "https://cdn.example.com/jobs/job_qwen25_05b_demo_remote/lora.tar.gz"
+}
+```
+
+---
+
+## 5. Какие upload endpoints нужны
+
+### Логи
+
+`POST /api/jobs/upload/logs`
+
+Принимает:
+
+* `trainer.log`
+
+Сохраняет как:
+
+* plain text log artifact
+
+### Effective config
+
+`POST /api/jobs/upload/config`
+
+Принимает:
+
+* `effective-job.json`
+
+Сохраняет как:
+
+* исходный эффективный конфиг job
+
+### Итоговый summary
+
+`POST /api/jobs/upload/summary`
+
+Принимает:
+
+* `job-result.json`
+
+Сохраняет как:
+
+* финальный канонический результат job
+
+### Train metrics
+
+`POST /api/jobs/upload/train-metrics`
+
+Принимает:
+
+* `*.train_metrics.json`
+
+### Train history
+
+`POST /api/jobs/upload/train-history`
+
+Принимает:
+
+* `*.train_history.json`
+
+### Eval summary
+
+`POST /api/jobs/upload/eval-summary`
+
+Принимает:
+
+* `summary.json` с метриками eval
+
+### Eval details
+
+`POST /api/jobs/upload/eval-details`
+
+Принимает:
+
+* `detailed.csv`
+
+### LoRA archive
+
+`POST /api/jobs/upload/lora`
+
+Принимает:
+
+* tar.gz с LoRA adapter
+
+### Merged archive
+
+`POST /api/jobs/upload/merged`
+
+Принимает:
+
+* tar.gz с merged model
+
+### Full archive
+
+`POST /api/jobs/upload/full-archive`
+
+Принимает:
+
+* tar.gz со всем output job
+
+---
+
+## 6. Что лучше хранить в БД
+
+Минимальная таблица `jobs`:
+
+```json
+{
+  "id": "job_qwen25_05b_demo_remote",
+  "name": "qwen25-05b-demo-remote",
+  "status": "running",
+  "stage": "training",
+  "progress": 37.5,
+  "message": "trainer log",
+  "created_at": "timestamp",
+  "updated_at": "timestamp",
+  "started_at": "timestamp|null",
+  "finished_at": "timestamp|null",
+  "error": "string|null",
+  "result_json": "json|null"
+}
+```
+
+Таблица `job_events`:
+
+```json
+{
+  "id": "evt_xxx",
+  "job_id": "job_qwen25_05b_demo_remote",
+  "event": "status|progress|final",
+  "payload": "json",
+  "created_at": "timestamp"
+}
+```
+
+Таблица `job_artifacts`:
+
+```json
+{
+  "id": "art_xxx",
+  "job_id": "job_qwen25_05b_demo_remote",
+  "artifact_type": "logs|config|summary|train_metrics|train_history|eval_summary|eval_details|lora_archive|merged_archive|full_archive",
+  "filename": "string",
+  "storage_key": "string",
+  "download_url": "string|null",
+  "content_type": "string|null",
+  "size_bytes": "number|null",
+  "created_at": "timestamp"
+}
+```
+
+---
+
+## 7. Рекомендуемая логика статусов
+
+Я бы использовал такой lifecycle:
+
+* `queued`
+* `started`
+* `running`
+* `finished`
+* `failed`
+
+И такие stage:
+
+* `bootstrap`
+* `hf_login`
+* `prepare_assets`
+* `load_model`
+* `load_dataset`
+* `training`
+* `save_lora`
+* `merge_lora`
+* `train_completed`
+* `evaluation_prepare`
+* `evaluation`
+* `evaluation_completed`
+* `finished`
+* `failed`
+
+---
+
+## 8. Авторизация
+
+Лучше передавать bearer token в конфиге:
+
+```json
+{
+  "reporting": {
+    "status": {
+      "enabled": true,
+      "url": "https://example.com/api/jobs/status",
+      "auth": {
+        "bearer_token": "secret-token"
+      }
+    }
+  },
+  "upload": {
+    "enabled": true,
+    "target": "url",
+    "auth": {
+      "bearer_token": "secret-token"
+    }
+  }
+}
+```
+
+Backend должен принимать:
+
+```http
+Authorization: Bearer secret-token
+```
+
+---
+
+## 9. Идемпотентность
+
+Полезно, чтобы backend спокойно переживал ретраи.
+
+Для этого:
+
+* `job_id` должен быть уникальным и приходить из твоего сервиса
+* повторный `status/progress/final` по тому же `job_id` не должен ломать запись
+* upload можно делать либо:
+
+  * overwrite по `(job_id, artifact_type)`
+  * либо versioned storage, но в БД держать “последнюю актуальную версию”
+
+---
+
+## 10. Что я советую сделать на твоём backend сразу
+
+1. Один endpoint на status
+2. Один endpoint на progress
+3. Один endpoint на final
+4. Один универсальный upload endpoint вида
+   `POST /api/jobs/upload/:artifactType`
+5. В UI показывать:
+
+   * status
+   * stage
+   * progress
+   * train summary
+   * eval summary
+   * список артефактов
+
+---
+
+## 11. Минимальный backend response contract
+
+Для всех callback endpoints:
+
+```json
+{
+  "ok": true
+}
+```
+
+Для всех upload endpoints:
+
+```json
+{
+  "ok": true,
+  "artifact_id": "art_xxx",
+  "download_url": "https://cdn.example.com/path/to/file"
+}
+```
+
+Коды:
+
+* `200` или `201` — успех
+* `400` — невалидный payload
+* `401/403` — auth error
+* `404` — job not found, если ты это хочешь строго контролировать
+* `500` — временная ошибка, runner попробует/сможет быть перезапущен на уровне orchestration
+
+---
+
+## 12. Пример одной job-конфигурации с backend-контрактом
+
+```json
+{
+  "job_id": "job_20260319_001",
+  "job_name": "qwen25-math-v3",
+  "reporting": {
+    "status": {
+      "enabled": true,
+      "url": "https://api.example.com/jobs/status",
+      "auth": {
+        "bearer_token": "secret-token"
+      }
+    },
+    "progress": {
+      "enabled": true,
+      "url": "https://api.example.com/jobs/progress",
+      "auth": {
+        "bearer_token": "secret-token"
+      }
+    },
+    "final": {
+      "enabled": true,
+      "url": "https://api.example.com/jobs/final",
+      "auth": {
+        "bearer_token": "secret-token"
+      }
+    }
+  },
+  "upload": {
+    "enabled": true,
+    "target": "url",
+    "auth": {
+      "bearer_token": "secret-token"
+    },
+    "url_targets": {
+      "logs_url": "https://api.example.com/jobs/upload/logs",
+      "summary_url": "https://api.example.com/jobs/upload/summary",
+      "lora_archive_url": "https://api.example.com/jobs/upload/lora",
+      "merged_archive_url": "https://api.example.com/jobs/upload/merged",
+      "eval_summary_url": "https://api.example.com/jobs/upload/eval-summary",
+      "eval_details_url": "https://api.example.com/jobs/upload/eval-details"
+    }
+  }
+}
+
+
+path: /examples/job.local.json
+----------------------------------------
+{
+  "job_id": "job_qwen25_05b_demo_local",
+  "job_name": "qwen25-05b-demo-local",
+  "mode": "local",
+  "model": {
+    "source": "local",
+    "local_path": "/models/qwen25-05b",
+    "trust_remote_code": false,
+    "load_in_4bit": true,
+    "dtype": "bfloat16",
+    "max_seq_length": 4096
+  },
+  "dataset": {
+    "source": "local",
+    "train_path": "/data/train.json",
+    "val_path": "/data/val.json",
+    "format": "instruction_output",
+    "input_field": "input",
+    "output_field": "output"
+  },
+  "training": {
+    "method": "qlora",
+    "max_seq_length": 4096,
+    "per_device_train_batch_size": 4,
+    "gradient_accumulation_steps": 4,
+    "num_train_epochs": 1,
+    "learning_rate": 0.0001,
+    "warmup_ratio": 0.03,
+    "logging_steps": 1,
+    "save_steps": 50,
+    "eval_steps": 50,
+    "bf16": true,
+    "packing": true
+  },
+  "lora": {
+    "r": 32,
+    "lora_alpha": 64,
+    "lora_dropout": 0.0,
+    "bias": "none",
+    "use_gradient_checkpointing": "unsloth",
+    "random_state": 3407,
+    "target_modules": [
+      "q_proj",
+      "k_proj",
+      "v_proj",
+      "o_proj",
+      "gate_proj",
+      "up_proj",
+      "down_proj"
+    ]
+  },
+  "outputs": {
+    "base_dir": "/output/qwen25-05b-demo-local"
+  },
+  "postprocess": {
+    "merge_lora": true,
+    "save_merged_16bit": true,
+    "run_awq_quantization": false
+  },
+  "evaluation": {
+    "enabled": true,
+    "target": "auto",
+    "max_samples": 100,
+    "max_new_tokens": 128,
+    "temperature": 0.0,
+    "do_sample": false,
+    "dataset": {
+      "source": "local",
+      "path": "/data/eval.jsonl",
+      "format": "jsonl",
+      "question_field": "question",
+      "answer_field": "candidate_answer",
+      "score_field": "reference_score",
+      "max_score_field": "max_score",
+      "tags_field": "hash_tags"
+    }
+  },
+  "reporting": {
+    "status": {
+      "enabled": true,
+      "url": "https://example.com/api/jobs/status"
+    },
+    "progress": {
+      "enabled": true,
+      "url": "https://example.com/api/jobs/progress"
+    },
+    "final": {
+      "enabled": true,
+      "url": "https://example.com/api/jobs/final"
+    }
+  },
+  "upload": {
+    "enabled": true,
+    "target": "url",
+    "timeout_sec": 300,
+    "url_targets": {
+      "logs_url": "https://example.com/api/jobs/upload/logs",
+      "effective_config_url": "https://example.com/api/jobs/upload/config",
+      "summary_url": "https://example.com/api/jobs/upload/summary",
+      "train_metrics_url": "https://example.com/api/jobs/upload/train-metrics",
+      "train_history_url": "https://example.com/api/jobs/upload/train-history",
+      "eval_summary_url": "https://example.com/api/jobs/upload/eval-summary",
+      "eval_details_url": "https://example.com/api/jobs/upload/eval-details",
+      "lora_archive_url": "https://example.com/api/jobs/upload/lora",
+      "merged_archive_url": "https://example.com/api/jobs/upload/merged",
+      "full_archive_url": "https://example.com/api/jobs/upload/full-archive"
+    }
+  },
+  "huggingface": {
+    "enabled": false,
+    "push_lora": false,
+    "push_merged": false
+  }
+}
+
+
+path: /examples/job.remote.json
+----------------------------------------
+{
+  "job_id": "job_qwen_7b_remote_001",
+  "job_name": "qwen-7b-remote-train",
+  "mode": "remote",
+  "model": {
+    "source": "local",
+    "local_path": "/app",
+    "trust_remote_code": false,
+    "load_in_4bit": true,
+    "dtype": "bfloat16",
+    "max_seq_length": 1024
+  },
+  "dataset": {
+    "source": "url",
+    "train_url": "https://example.com/api/datasets/train.json",
+    "val_url": "https://example.com/api/datasets/val.json",
+    "format": "instruction_output",
+    "input_field": "input",
+    "output_field": "output"
+  },
+  "training": {
+    "method": "qlora",
+    "max_seq_length": 1024,
+    "per_device_train_batch_size": 1,
+    "gradient_accumulation_steps": 1,
+    "num_train_epochs": 1,
+    "learning_rate": 0.0001,
+    "warmup_ratio": 0.03,
+    "logging_steps": 1,
+    "save_steps": 10,
+    "eval_steps": 10,
+    "bf16": true,
+    "packing": false,
+    "save_total_limit": 1,
+    "optim": "adamw_8bit"
+  },
+  "lora": {
+    "r": 8,
+    "lora_alpha": 16,
+    "lora_dropout": 0.0,
+    "bias": "none",
+    "use_gradient_checkpointing": "unsloth",
+    "random_state": 3407,
+    "target_modules": [
+      "q_proj",
+      "k_proj",
+      "v_proj",
+      "o_proj"
+    ]
+  },
+  "outputs": {
+    "base_dir": "/output/qwen-7b-remote-train"
+  },
+  "postprocess": {
+    "merge_lora": true,
+    "save_merged_16bit": true,
+    "run_awq_quantization": false
+  },
+  "evaluation": {
+    "enabled": true,
+    "target": "auto",
+    "max_samples": 10,
+    "max_new_tokens": 64,
+    "temperature": 0.0,
+    "do_sample": false,
+    "dataset": {
+      "source": "url",
+      "url": "https://example.com/api/datasets/eval.jsonl",
+      "format": "jsonl",
+      "question_field": "question",
+      "answer_field": "candidate_answer",
+      "score_field": "reference_score",
+      "max_score_field": "max_score",
+      "tags_field": "hash_tags"
+    }
+  },
+  "reporting": {
+    "status": {
+      "enabled": true,
+      "url": "https://example.com/api/jobs/status",
+      "timeout_sec": 15,
+      "auth": {
+        "bearer_token": "replace-me"
+      }
+    },
+    "progress": {
+      "enabled": true,
+      "url": "https://example.com/api/jobs/progress",
+      "timeout_sec": 15,
+      "auth": {
+        "bearer_token": "replace-me"
+      }
+    },
+    "final": {
+      "enabled": true,
+      "url": "https://example.com/api/jobs/final",
+      "timeout_sec": 15,
+      "auth": {
+        "bearer_token": "replace-me"
+      }
+    }
+  },
+  "upload": {
+    "enabled": true,
+    "target": "url",
+    "timeout_sec": 300,
+    "auth": {
+      "bearer_token": "replace-me"
+    },
+    "url_targets": {
+      "logs_url": "https://example.com/api/jobs/upload/logs",
+      "effective_config_url": "https://example.com/api/jobs/upload/config",
+      "summary_url": "https://example.com/api/jobs/upload/summary",
+      "train_metrics_url": "https://example.com/api/jobs/upload/train-metrics",
+      "train_history_url": "https://example.com/api/jobs/upload/train-history",
+      "eval_summary_url": "https://example.com/api/jobs/upload/eval-summary",
+      "eval_details_url": "https://example.com/api/jobs/upload/eval-details",
+      "lora_archive_url": "https://example.com/api/jobs/upload/lora",
+      "merged_archive_url": "https://example.com/api/jobs/upload/merged",
+      "full_archive_url": "https://example.com/api/jobs/upload/full-archive"
+    }
+  },
+  "huggingface": {
+    "enabled": false,
+    "push_lora": false,
+    "push_merged": false,
+    "private": true,
+    "commit_message": "trainer-service upload"
+  }
+}
+
+
+path: /packages/README.md
+----------------------------------------
+
+
+
+path: /README.md
+----------------------------------------
+# trainer-service
+
+Одноразовый job-runner для fine-tuning на Vast.ai.
+
+Сервис не хранит состояние как backend-приложение. Он запускается на один job, читает один JSON-конфиг, выполняет pipeline и выгружает наружу:
+- статусы;
+- прогресс;
+- логи;
+- LoRA;
+- merged model;
+- train metrics;
+- evaluation results.
+
+## Pipeline
+
+1. Загружает JSON-конфиг из локального файла или по URL.
+2. Логинится в Hugging Face по `HF_TOKEN`, если токен передан.
+3. При необходимости скачивает train/val/eval датасеты по URL.
+4. Запускает fine-tuning через Unsloth.
+5. Сохраняет LoRA adapter.
+6. Опционально сохраняет merged 16-bit модель.
+7. Опционально запускает evaluation после обучения.
+8. Опционально:
+   - пушит LoRA / merged model в Hugging Face;
+   - загружает артефакты по URL;
+   - отправляет callbacks со статусами и прогрессом.
+9. Сохраняет итог в `job-result.json`.
+
+## Ключевые требования, которые покрыты
+
+- Конфиг может лежать по URL.
+- Модель может быть уже встроена в Docker image (`model.source=local`).
+- Есть внешние callbacks для:
+  - started/running/finished/failed;
+  - progress;
+  - final result.
+- Есть отдельная выгрузка:
+  - logs;
+  - effective config;
+  - train metrics / history;
+  - eval summary / details;
+  - LoRA archive;
+  - merged archive;
+  - full archive.
+- Есть post-train evaluation с метриками:
+  - `model`
+  - `samples`
+  - `parseSuccessRate`
+  - `mae`
+  - `rmse`
+  - `exactRate`
+  - `within1Rate`
+  - `within2Rate`
+  - `meanSignedError`
+  - `avgPredictedScore`
+  - `parseErrors`
+  - `inferenceErrors`
+  - `emptyResponses`
+
+## Запуск
+
+### Через env
+
+```bash
+docker run --rm --gpus all \
+  -e HF_TOKEN=hf_xxx \
+  -e CONFIG_SOURCE=remote \
+  -e CONFIG_REF=https://example.com/job.json \
+  -v $(pwd)/output:/output \
+  trainer-service
+
+
+path: /requirements.txt
+----------------------------------------
+unsloth
+unsloth-zoo
+
+bitsandbytes>=0.45.0
+xformers==0.0.35
+
+transformers>=4.48.0
+datasets>=3.6.0
+accelerate>=1.10.1
+trl>=0.19.0
+peft>=0.17.1
+sentencepiece>=0.2.1
+huggingface_hub[hf-xet]
+pydantic>=2.11.7
+requests>=2.32.3
+
+
+=== SUMMARY ===
+included: 27
+skipped(binary): 0
+skipped(size): 0
+skipped(ext): 0
+totalBytes(approx): 140551

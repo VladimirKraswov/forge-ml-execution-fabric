@@ -1,0 +1,19 @@
+services:
+  itk-ai-trainer-service:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    image: itk-ai-trainer-service
+    env_file:
+      - .env.local.example
+    volumes:
+      - ./examples:/configs
+      - ./data:/data
+      - ./output:/output
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

@@ -1,0 +1,114 @@
+{
+  "job_id": "job_qwen25_05b_demo_local",
+  "job_name": "qwen25-05b-demo-local",
+  "mode": "local",
+  "model": {
+    "source": "local",
+    "local_path": "/models/qwen25-05b",
+    "trust_remote_code": false,
+    "load_in_4bit": true,
+    "dtype": "bfloat16",
+    "max_seq_length": 4096
+  },
+  "dataset": {
+    "source": "local",
+    "train_path": "/data/train.json",
+    "val_path": "/data/val.json",
+    "format": "instruction_output",
+    "input_field": "input",
+    "output_field": "output"
+  },
+  "training": {
+    "method": "qlora",
+    "max_seq_length": 4096,
+    "per_device_train_batch_size": 4,
+    "gradient_accumulation_steps": 4,
+    "num_train_epochs": 1,
+    "learning_rate": 0.0001,
+    "warmup_ratio": 0.03,
+    "logging_steps": 1,
+    "save_steps": 50,
+    "eval_steps": 50,
+    "bf16": true,
+    "packing": true
+  },
+  "lora": {
+    "r": 32,
+    "lora_alpha": 64,
+    "lora_dropout": 0.0,
+    "bias": "none",
+    "use_gradient_checkpointing": "unsloth",
+    "random_state": 3407,
+    "target_modules": [
+      "q_proj",
+      "k_proj",
+      "v_proj",
+      "o_proj",
+      "gate_proj",
+      "up_proj",
+      "down_proj"
+    ]
+  },
+  "outputs": {
+    "base_dir": "/output/qwen25-05b-demo-local"
+  },
+  "postprocess": {
+    "merge_lora": true,
+    "save_merged_16bit": true,
+    "run_awq_quantization": false
+  },
+  "evaluation": {
+    "enabled": true,
+    "target": "auto",
+    "max_samples": 100,
+    "max_new_tokens": 128,
+    "temperature": 0.0,
+    "do_sample": false,
+    "dataset": {
+      "source": "local",
+      "path": "/data/eval.jsonl",
+      "format": "jsonl",
+      "question_field": "question",
+      "answer_field": "candidate_answer",
+      "score_field": "reference_score",
+      "max_score_field": "max_score",
+      "tags_field": "hash_tags"
+    }
+  },
+  "reporting": {
+    "status": {
+      "enabled": true,
+      "url": "https://example.com/api/jobs/status"
+    },
+    "progress": {
+      "enabled": true,
+      "url": "https://example.com/api/jobs/progress"
+    },
+    "final": {
+      "enabled": true,
+      "url": "https://example.com/api/jobs/final"
+    }
+  },
+  "upload": {
+    "enabled": true,
+    "target": "url",
+    "timeout_sec": 300,
+    "url_targets": {
+      "logs_url": "https://example.com/api/jobs/upload/logs",
+      "effective_config_url": "https://example.com/api/jobs/upload/config",
+      "summary_url": "https://example.com/api/jobs/upload/summary",
+      "train_metrics_url": "https://example.com/api/jobs/upload/train-metrics",
+      "train_history_url": "https://example.com/api/jobs/upload/train-history",
+      "eval_summary_url": "https://example.com/api/jobs/upload/eval-summary",
+      "eval_details_url": "https://example.com/api/jobs/upload/eval-details",
+      "lora_archive_url": "https://example.com/api/jobs/upload/lora",
+      "merged_archive_url": "https://example.com/api/jobs/upload/merged",
+      "full_archive_url": "https://example.com/api/jobs/upload/full-archive"
+    }
+  },
+  "huggingface": {
+    "enabled": false,
+    "push_lora": false,
+    "push_merged": false
+  }
+}

@@ -1,0 +1,130 @@
+{
+  "job_id": "job_qwen_7b_remote_001",
+  "job_name": "qwen-7b-remote-train",
+  "mode": "remote",
+  "model": {
+    "source": "local",
+    "local_path": "/app",
+    "trust_remote_code": false,
+    "load_in_4bit": true,
+    "dtype": "bfloat16",
+    "max_seq_length": 1024
+  },
+  "dataset": {
+    "source": "url",
+    "train_url": "https://example.com/api/datasets/train.json",
+    "val_url": "https://example.com/api/datasets/val.json",
+    "format": "instruction_output",
+    "input_field": "input",
+    "output_field": "output"
+  },
+  "training": {
+    "method": "qlora",
+    "max_seq_length": 1024,
+    "per_device_train_batch_size": 1,
+    "gradient_accumulation_steps": 1,
+    "num_train_epochs": 1,
+    "learning_rate": 0.0001,
+    "warmup_ratio": 0.03,
+    "logging_steps": 1,
+    "save_steps": 10,
+    "eval_steps": 10,
+    "bf16": true,
+    "packing": false,
+    "save_total_limit": 1,
+    "optim": "adamw_8bit"
+  },
+  "lora": {
+    "r": 8,
+    "lora_alpha": 16,
+    "lora_dropout": 0.0,
+    "bias": "none",
+    "use_gradient_checkpointing": "unsloth",
+    "random_state": 3407,
+    "target_modules": [
+      "q_proj",
+      "k_proj",
+      "v_proj",
+      "o_proj"
+    ]
+  },
+  "outputs": {
+    "base_dir": "/output/qwen-7b-remote-train"
+  },
+  "postprocess": {
+    "merge_lora": true,
+    "save_merged_16bit": true,
+    "run_awq_quantization": false
+  },
+  "evaluation": {
+    "enabled": true,
+    "target": "auto",
+    "max_samples": 10,
+    "max_new_tokens": 64,
+    "temperature": 0.0,
+    "do_sample": false,
+    "dataset": {
+      "source": "url",
+      "url": "https://example.com/api/datasets/eval.jsonl",
+      "format": "jsonl",
+      "question_field": "question",
+      "answer_field": "candidate_answer",
+      "score_field": "reference_score",
+      "max_score_field": "max_score",
+      "tags_field": "hash_tags"
+    }
+  },
+  "reporting": {
+    "status": {
+      "enabled": true,
+      "url": "https://example.com/api/jobs/status",
+      "timeout_sec": 15,
+      "auth": {
+        "bearer_token": "replace-me"
+      }
+    },
+    "progress": {
+      "enabled": true,
+      "url": "https://example.com/api/jobs/progress",
+      "timeout_sec": 15,
+      "auth": {
+        "bearer_token": "replace-me"
+      }
+    },
+    "final": {
+      "enabled": true,
+      "url": "https://example.com/api/jobs/final",
+      "timeout_sec": 15,
+      "auth": {
+        "bearer_token": "replace-me"
+      }
+    }
+  },
+  "upload": {
+    "enabled": true,
+    "target": "url",
+    "timeout_sec": 300,
+    "auth": {
+      "bearer_token": "replace-me"
+    },
+    "url_targets": {
+      "logs_url": "https://example.com/api/jobs/upload/logs",
+      "effective_config_url": "https://example.com/api/jobs/upload/config",
+      "summary_url": "https://example.com/api/jobs/upload/summary",
+      "train_metrics_url": "https://example.com/api/jobs/upload/train-metrics",
+      "train_history_url": "https://example.com/api/jobs/upload/train-history",
+      "eval_summary_url": "https://example.com/api/jobs/upload/eval-summary",
+      "eval_details_url": "https://example.com/api/jobs/upload/eval-details",
+      "lora_archive_url": "https://example.com/api/jobs/upload/lora",
+      "merged_archive_url": "https://example.com/api/jobs/upload/merged",
+      "full_archive_url": "https://example.com/api/jobs/upload/full-archive"
+    }
+  },
+  "huggingface": {
+    "enabled": false,
+    "push_lora": false,
+    "push_merged": false,
+    "private": true,
+    "commit_message": "trainer-service upload"
+  }
+}
