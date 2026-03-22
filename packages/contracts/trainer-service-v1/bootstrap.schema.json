@@ -1,0 +1,16 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "TrainerBootstrap",
+  "type": "object",
+  "properties": {
+    "job_id": { "type": "string" },
+    "job_name": { "type": "string" },
+    "callback_auth_token": { "type": "string" },
+    "status_url": { "type": "string", "format": "uri" },
+    "progress_url": { "type": "string", "format": "uri" },
+    "final_url": { "type": "string", "format": "uri" },
+    "logs_url": { "type": "string", "format": "uri" },
+    "config": { "$ref": "job-config.schema.json" }
+  },
+  "required": ["job_id", "callback_auth_token", "status_url", "config"]
+}

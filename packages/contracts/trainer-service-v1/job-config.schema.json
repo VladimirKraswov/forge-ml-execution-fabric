@@ -1,0 +1,46 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "TrainerJobConfig",
+  "type": "object",
+  "properties": {
+    "job_id": { "type": "string" },
+    "job_name": { "type": "string" },
+    "mode": { "enum": ["local", "remote", "auto"] },
+    "model": {
+      "type": "object",
+      "properties": {
+        "source": { "enum": ["local", "huggingface"] },
+        "local_path": { "type": "string" },
+        "repo_id": { "type": "string" }
+      },
+      "required": ["source"]
+    },
+    "dataset": {
+      "type": "object",
+      "properties": {
+        "source": { "enum": ["local", "url"] },
+        "train_url": { "type": "string" }
+      },
+      "required": ["source"]
+    },
+    "pipeline": {
+      "type": "object",
+      "properties": {
+        "evaluation": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "dataset": { "type": "object" }
+          },
+          "if": {
+            "properties": { "enabled": { "const": true } }
+          },
+          "then": {
+            "required": ["dataset"]
+          }
+        }
+      }
+    }
+  },
+  "required": ["job_name", "model", "dataset"]
+}
