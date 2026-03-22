@@ -968,7 +968,7 @@ function buildTrainerJobPayload({
 async function main() {
   const args = {
     projectRoot: process.argv[2] || '.', // should be path to forge-ml-execution-fabric
-    trainerServiceDir: './services/trainer-service',
+    trainerServiceDir: './apps/executor-trainer', // Исправлено: правильный путь к executor'у
     runtimeImage: EXECUTOR_IMAGE,
     hfRepo: HF_REPO_TARGET,
     baseImage: 'igortet/model-qwen-7b',
@@ -1006,7 +1006,12 @@ async function main() {
     if (!args.trainerServiceDir) {
       throw new Error(`Image ${EXECUTOR_IMAGE} not found and --trainer-service-dir not provided to build it.`);
     }
-    await buildAndPushExecutorImage(args.trainerServiceDir, EXECUTOR_IMAGE, args.verbose);
+    // Проверяем, что директория с исходниками executor'а существует
+    const executorSourceDir = path.resolve(projectRoot, args.trainerServiceDir);
+    if (!fs.existsSync(executorSourceDir)) {
+      throw new Error(`Executor source directory not found: ${executorSourceDir}`);
+    }
+    await buildAndPushExecutorImage(executorSourceDir, EXECUTOR_IMAGE, args.verbose);
   } else {
     info(`Executor image ${EXECUTOR_IMAGE} already exists, using it.`);
   }
