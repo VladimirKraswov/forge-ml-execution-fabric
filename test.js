@@ -1010,7 +1010,7 @@ async function main() {
       runtimeProfileId,
       jobId,
       runtimeImage: EXECUTOR_IMAGE,
-      datasetBaseUrl: '', // not used
+      datasetBaseUrl: fixture.publicBaseUrl,
       hfRepo: HF_REPO_TARGET,
       logicalBaseModelId: args.logicalBaseModelId,
     });
