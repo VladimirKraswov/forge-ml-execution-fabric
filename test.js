@@ -35,78 +35,6 @@ function color(code, text) {
   if (!process.stdout.isTTY) return text;
   return `\u001b[${code}m${text}\u001b[0m`;
 }
-async function startFixtureServer(port, datasetRoot, verbose = false) {
-  await fsp.mkdir(datasetRoot, { recursive: true });
-
-  const trainSamples = [
-    { input: 'Назови столицу Франции.', output: 'Столица Франции — Париж.' },
-    { input: 'Сколько будет 2+2?', output: '2+2=4.' },
-  ];
-  const valSamples = [
-    { input: 'Назови столицу Италии.', output: 'Столица Италии — Рим.' },
-  ];
-  const evalSamples = [
-    {
-      id: 'eval_1',
-      question: 'Сколько будет 2+2?',
-      candidate_answer: '4',
-      reference_score: 5,
-      max_score: 5,
-      hash_tags: ['math', 'sanity'],
-    },
-  ];
-
-  await fsp.writeFile(path.join(datasetRoot, 'train.json'), JSON.stringify(trainSamples, null, 2), 'utf-8');
-  await fsp.writeFile(path.join(datasetRoot, 'val.json'), JSON.stringify(valSamples, null, 2), 'utf-8');
-  await fsp.writeFile(
-    path.join(datasetRoot, 'eval.jsonl'),
-    evalSamples.map((row) => JSON.stringify(row)).join('\n') + '\n',
-    'utf-8'
-  );
-
-  const server = http.createServer(async (req, res) => {
-    try {
-      const url = new URL(req.url, `http://${req.headers.host}`);
-      const routeMap = {
-        '/datasets/train.json': { file: 'train.json', contentType: 'application/json; charset=utf-8' },
-        '/datasets/val.json': { file: 'val.json', contentType: 'application/json; charset=utf-8' },
-        '/datasets/eval.jsonl': { file: 'eval.jsonl', contentType: 'application/x-ndjson; charset=utf-8' },
-        '/health': { json: { ok: true } },
-      };
-      const route = routeMap[url.pathname];
-      if (!route) {
-        res.statusCode = 404;
-        res.end('not found');
-        return;
-      }
-      if (route.json) {
-        res.statusCode = 200;
-        res.setHeader('content-type', 'application/json; charset=utf-8');
-        res.end(JSON.stringify(route.json));
-        return;
-      }
-      const abs = path.join(datasetRoot, route.file);
-      const data = await fsp.readFile(abs);
-      res.statusCode = 200;
-      res.setHeader('content-type', route.contentType);
-      res.end(data);
-    } catch (error) {
-      res.statusCode = 500;
-      res.end(String(error.message || error));
-    }
-  });
-
-  await new Promise((resolve, reject) => {
-    server.once('error', reject);
-    server.listen(port, '0.0.0.0', resolve);
-  });
-
-  const externalBaseUrl = `http://127.0.0.1:${port}`;
-  const publicBaseUrl = buildContainerBaseUrl(port);
-
-  if (verbose) info(`Fixture dataset server listening on 0.0.0.0:${port}`);
-  return { server, externalBaseUrl, publicBaseUrl };
-}
 function info(text) { console.log(color('36', `• ${text}`)); }
 function ok(text) { console.log(color('32', `✔ ${text}`)); }
 function warn(text) { console.log(color('33', `! ${text}`)); }
@@ -854,6 +782,83 @@ async function waitForHfArtifacts(repo, token, timeoutMs) {
 }
 
 // ============================================================================
+// Fixture server
+// ============================================================================
+
+async function startFixtureServer(port, datasetRoot, verbose = false) {
+  await fsp.mkdir(datasetRoot, { recursive: true });
+
+  const trainSamples = [
+    { input: 'Назови столицу Франции.', output: 'Столица Франции — Париж.' },
+    { input: 'Сколько будет 2+2?', output: '2+2=4.' },
+  ];
+  const valSamples = [
+    { input: 'Назови столицу Италии.', output: 'Столица Италии — Рим.' },
+  ];
+  const evalSamples = [
+    {
+      id: 'eval_1',
+      question: 'Сколько будет 2+2?',
+      candidate_answer: '4',
+      reference_score: 5,
+      max_score: 5,
+      hash_tags: ['math', 'sanity'],
+    },
+  ];
+
+  await fsp.writeFile(path.join(datasetRoot, 'train.json'), JSON.stringify(trainSamples, null, 2), 'utf-8');
+  await fsp.writeFile(path.join(datasetRoot, 'val.json'), JSON.stringify(valSamples, null, 2), 'utf-8');
+  await fsp.writeFile(
+    path.join(datasetRoot, 'eval.jsonl'),
+    evalSamples.map((row) => JSON.stringify(row)).join('\n') + '\n',
+    'utf-8'
+  );
+
+  const server = http.createServer(async (req, res) => {
+    try {
+      const url = new URL(req.url, `http://${req.headers.host}`);
+      const routeMap = {
+        '/datasets/train.json': { file: 'train.json', contentType: 'application/json; charset=utf-8' },
+        '/datasets/val.json': { file: 'val.json', contentType: 'application/json; charset=utf-8' },
+        '/datasets/eval.jsonl': { file: 'eval.jsonl', contentType: 'application/x-ndjson; charset=utf-8' },
+        '/health': { json: { ok: true } },
+      };
+      const route = routeMap[url.pathname];
+      if (!route) {
+        res.statusCode = 404;
+        res.end('not found');
+        return;
+      }
+      if (route.json) {
+        res.statusCode = 200;
+        res.setHeader('content-type', 'application/json; charset=utf-8');
+        res.end(JSON.stringify(route.json));
+        return;
+      }
+      const abs = path.join(datasetRoot, route.file);
+      const data = await fsp.readFile(abs);
+      res.statusCode = 200;
+      res.setHeader('content-type', route.contentType);
+      res.end(data);
+    } catch (error) {
+      res.statusCode = 500;
+      res.end(String(error.message || error));
+    }
+  });
+
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(port, '0.0.0.0', resolve);
+  });
+
+  const externalBaseUrl = `http://127.0.0.1:${port}`;
+  const publicBaseUrl = buildContainerBaseUrl(port);
+
+  if (verbose) info(`Fixture dataset server listening on 0.0.0.0:${port}`);
+  return { server, externalBaseUrl, publicBaseUrl };
+}
+
+// ============================================================================
 // Build job payload
 // ============================================================================
 
@@ -1061,7 +1066,7 @@ async function main() {
   }
 
   let backend = null;
-  let fixture = null;  // <-- добавить объявление
+  let fixture = null;
 
   try {
     // 1. Запустить фикстуру
@@ -1087,7 +1092,7 @@ async function main() {
       runtimeProfileId,
       jobId,
       runtimeImage: EXECUTOR_IMAGE,
-      datasetBaseUrl: fixture.publicBaseUrl,  // <-- теперь fixture определена
+      datasetBaseUrl: fixture.publicBaseUrl,
       hfRepo: HF_REPO_TARGET,
       logicalBaseModelId: args.logicalBaseModelId,
     });
@@ -1190,7 +1195,8 @@ async function main() {
     if (!downloadableArtifact?.downloadUrl && !downloadableArtifact?.download_url && !downloadableArtifact?.uri) {
       throw new Error('No downloadable artifact found');
     }
-    const downloadUrl = downloadableArtifact.downloadUrl || downloadableArtifact.download_url || downloadableArtifact.uri;
+    const rawUrl = downloadableArtifact.downloadUrl || downloadableArtifact.download_url || downloadableArtifact.uri;
+    const downloadUrl = remapUrlForHost(rawUrl, { backendPort: args.port, datasetsPort: args.datasetsPort });
     const artifactDownloadPath = path.join(workRoot, 'downloaded-artifact.bin');
     await downloadArtifact(downloadUrl, artifactDownloadPath, jwt);
     const downloadedStat = await fsp.stat(artifactDownloadPath);
