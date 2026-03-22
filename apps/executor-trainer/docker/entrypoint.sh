@@ -7,13 +7,13 @@ echo "==> trainer-service starting"
 
 if [ "$#" -gt 0 ]; then
   echo "==> launching with explicit CLI args: $*"
-  exec python /trainer/app/runner.py "$@"
+  exec python -m app.runner "$@"
 fi
 
 if [ -n "${JOB_CONFIG_URL:-}" ]; then
   echo "==> remote bootstrap via JOB_CONFIG_URL"
   echo "==> job config url: ${JOB_CONFIG_URL}"
-  exec python /trainer/app/runner.py --job-config-url "${JOB_CONFIG_URL}"
+  exec python -m app.runner --job-config-url "${JOB_CONFIG_URL}"
 fi
 
 CONFIG_SOURCE="${CONFIG_SOURCE:-local}"
@@ -34,7 +34,7 @@ if [ "${CONFIG_SOURCE}" = "remote" ]; then
     exit 1
   fi
 
-  exec python /trainer/app/runner.py --config "${CONFIG_REF}"
+  exec python -m app.runner --config "${CONFIG_REF}"
 fi
 
 if [ -z "${CONFIG_REF}" ]; then
@@ -46,4 +46,4 @@ if [ ! -f "${CONFIG_REF}" ]; then
   exit 1
 fi
 
-exec python /trainer/app/runner.py --config "${CONFIG_REF}"
+exec python -m app.runner --config "${CONFIG_REF}"
