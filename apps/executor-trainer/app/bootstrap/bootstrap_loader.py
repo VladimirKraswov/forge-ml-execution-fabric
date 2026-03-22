@@ -3,8 +3,8 @@ from __future__ import annotations
 import copy
 from typing import Any, Dict, Tuple
 
-from archiver import build_retry_session
-from schemas import JobConfig
+from ..pipeline.archiver import build_retry_session
+from ..bootstrap.schemas import JobConfig
 
 
 def _resolve_callback_url(payload: Dict[str, Any], key: str) -> str | None:

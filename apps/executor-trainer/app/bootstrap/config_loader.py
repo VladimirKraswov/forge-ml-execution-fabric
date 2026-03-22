@@ -5,7 +5,7 @@ from typing import Any, Dict
 
 import requests
 
-from schemas import JobConfig
+from ..bootstrap.schemas import JobConfig
 
 
 def _migrate_legacy_config(raw: Dict[str, Any], source_ref: str) -> Dict[str, Any]:

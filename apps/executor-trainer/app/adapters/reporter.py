@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Tuple
 
 import requests
 
-from schemas import CallbackConfig, JobConfig
+from ..bootstrap.schemas import CallbackConfig, JobConfig
 
 logger = logging.getLogger(__name__)
 
@@ -20,7 +20,6 @@ def _safe_timeout(timeout_sec: int | float | None, fallback: float = 3.0) -> Tup
     except Exception:
         value = fallback
 
-    # callback не должен надолго блокировать pipeline
     read_timeout = max(1.0, min(value, 5.0))
     connect_timeout = 2.0
     return connect_timeout, read_timeout
@@ -140,7 +139,6 @@ class Reporter:
         extra: Dict[str, Any] | None = None,
         logs: str | None = None,
     ) -> None:
-        # Не блокируем pipeline на обычных status callbacks
         self._emit(
             "status",
             {
@@ -161,7 +159,6 @@ class Reporter:
         message: str | None = None,
         extra: Dict[str, Any] | None = None,
     ) -> None:
-        # progress тоже best-effort
         self._emit(
             "progress",
             {
@@ -175,7 +172,6 @@ class Reporter:
         )
 
     def report_final(self, result: Dict[str, Any], status: str = "finished") -> None:
-        # final лучше попытаться доставить синхронно
         self._emit(
             "final",
             {
@@ -192,7 +188,6 @@ class Reporter:
         stage: str = "failed",
         extra: Dict[str, Any] | None = None,
     ) -> None:
-        # ошибку тоже лучше пробовать синхронно
         self._emit(
             "status",
             {
