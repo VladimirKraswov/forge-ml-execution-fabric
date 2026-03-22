@@ -5,7 +5,7 @@ from urllib.parse import urlparse
 
 import requests
 
-from schemas import JobConfig
+from ..bootstrap.schemas import JobConfig
 
 
 class AssetManager:
