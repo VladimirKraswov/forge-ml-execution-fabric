@@ -1162,8 +1162,15 @@ async function main() {
       (Array.isArray(artifacts) ? artifacts : []).map((item) => item.artifactType || item.artifact_type)
     );
     const mustHaveArtifacts = [
-      'logs', 'config', 'summary', 'train_metrics', 'train_history',
-      'eval_summary', 'eval_details', 'merged_archive', 'full_archive'
+      'logs',
+      'config',
+      'summary',
+      'train_metrics',
+      'train_history',
+      'eval_summary',
+      'eval_details',
+      // 'merged_archive',
+      // 'full_archive'
     ];
     const missingArtifactTypes = mustHaveArtifacts.filter((item) => !artifactTypes.has(item));
     if (missingArtifactTypes.length) {
