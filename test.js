@@ -942,8 +942,8 @@ function buildTrainerJobPayload({
 
 async function main() {
   const args = {
-    projectRoot: process.argv[2] || '.', // should be path to forge-ml-execution-fabric
-    trainerServiceDir: './apps/executor-trainer', // Исправлено: правильный путь к executor'у
+    projectRoot: process.argv[2] || '.',
+    trainerServiceDir: './apps/executor-trainer',
     runtimeImage: EXECUTOR_IMAGE,
     hfRepo: HF_REPO_TARGET,
     baseImage: 'igortet/model-qwen-7b',
@@ -961,27 +961,24 @@ async function main() {
   };
 
   const hfToken = String(process.env.HF_TOKEN || '').trim();
-  if (!hfToken) {
-    throw new Error('HF_TOKEN environment variable is required');
-  }
+  if (!hfToken) throw new Error('HF_TOKEN environment variable is required');
 
   const projectRoot = path.resolve(args.projectRoot);
-  // Проверяем, что сервер существует в новой структуре
   const serverPath = path.join(projectRoot, 'apps/orchestrator/src/server.js');
   ensureFile(serverPath);
-  // Также проверяем package.json в корне (для установки зависимостей, если нужно)
   ensureFile(path.join(projectRoot, 'package.json'));
 
   const workRoot = await fsp.mkdtemp(path.join(os.tmpdir(), 'forge-trainer-e2e-'));
+  const datasetRoot = path.join(workRoot, 'datasets');
+
   info(`Workdir: ${workRoot}`);
 
-  // Ensure executor image exists or build it
+  // Проверка/сборка образа
   const imageExists = await checkDockerImageExists(EXECUTOR_IMAGE);
   if (!imageExists) {
     if (!args.trainerServiceDir) {
-      throw new Error(`Image ${EXECUTOR_IMAGE} not found and --trainer-service-dir not provided to build it.`);
+      throw new Error(`Image ${EXECUTOR_IMAGE} not found and --trainer-service-dir not provided`);
     }
-    // Проверяем, что директория с исходниками executor'а существует
     const executorSourceDir = path.resolve(projectRoot, args.trainerServiceDir);
     if (!fs.existsSync(executorSourceDir)) {
       throw new Error(`Executor source directory not found: ${executorSourceDir}`);
@@ -992,8 +989,16 @@ async function main() {
   }
 
   let backend = null;
+  let fixture = null;  // <-- добавить объявление
 
   try {
+    // 1. Запустить фикстуру
+    info('Starting fixture dataset server');
+    fixture = await startFixtureServer(args.datasetsPort, datasetRoot, args.verbose);
+    ok('Fixture dataset server is up');
+    info(`Dataset base URL for containers: ${fixture.publicBaseUrl}`);
+
+    // 2. Запустить backend
     info('Starting backend');
     backend = await spawnBackend(projectRoot, workRoot, args);
     ok(`Backend is up on ${backend.externalBaseUrl}`);
@@ -1010,7 +1015,7 @@ async function main() {
       runtimeProfileId,
       jobId,
       runtimeImage: EXECUTOR_IMAGE,
-      datasetBaseUrl: fixture.publicBaseUrl,
+      datasetBaseUrl: fixture.publicBaseUrl,  // <-- теперь fixture определена
       hfRepo: HF_REPO_TARGET,
       logicalBaseModelId: args.logicalBaseModelId,
     });
@@ -1024,7 +1029,6 @@ async function main() {
     if (!launchSpec?.jobConfigUrl) throw new Error('Launch spec did not return jobConfigUrl');
     ok('Launch spec generated');
 
-    // Host-side bootstrap check (non-fatal)
     const bootstrapCheck = await tryFetchBootstrapForHost(launchSpec.jobConfigUrl, args);
     if (bootstrapCheck.ok) {
       ok('Bootstrap config fetch works from host');
@@ -1037,33 +1041,20 @@ async function main() {
       warn('Skipping strict host bootstrap validation; continuing with real container launch');
     }
 
-    // The executor will be started manually by the test, but we can also simulate by using the launch spec.
-    // In this test, we will NOT actually run the container automatically; we will output the command for manual verification.
-    // However, to keep the test fully automated, we could run it. But given the instructions, we just need to log.
-    // We'll output the command and then wait for the user to run it? That would not be automated.
-    // Instead, we can run it using the launch spec.
-    // Note: In the new architecture, the orchestrator does not run the container; it only provides the spec.
-    // But for E2E test, we need to run it to verify end-to-end. So we'll run it here.
-
     info(`Launching trainer container using: ${launchSpec.dockerRun}`);
     const launch = await launchJob(backend.externalBaseUrl, jwt, jobId);
     if (!launch?.launched) throw new Error('Launch endpoint did not confirm launch');
     ok(`Trainer container launched: ${launch.containerId || launch.containerName}`);
 
     const launchedContainerName = launch.containerName || launch.containerId || '';
-    if (launchedContainerName) {
-      info(`Launched container: ${launchedContainerName}`);
-    }
+    if (launchedContainerName) info(`Launched container: ${launchedContainerName}`);
 
     const terminalJob = await waitForJobTerminal(
       backend.externalBaseUrl,
       jwt,
       jobId,
       args.timeoutMinutes * 60 * 1000,
-      {
-        containerName: launchedContainerName,
-        verbose: args.verbose,
-      }
+      { containerName: launchedContainerName, verbose: args.verbose }
     );
 
     const terminalStatus = String(terminalJob.status || '').toLowerCase();
@@ -1098,27 +1089,13 @@ async function main() {
     const artifactTypes = new Set(
       (Array.isArray(artifacts) ? artifacts : []).map((item) => item.artifactType || item.artifact_type)
     );
-
     const mustHaveArtifacts = [
-      'logs',
-      'config',
-      'summary',
-      'train_metrics',
-      'train_history',
-      'eval_summary',
-      'eval_details',
-      'merged_archive',
-      'full_archive',
+      'logs', 'config', 'summary', 'train_metrics', 'train_history',
+      'eval_summary', 'eval_details', 'merged_archive', 'full_archive'
     ];
-
     const missingArtifactTypes = mustHaveArtifacts.filter((item) => !artifactTypes.has(item));
     if (missingArtifactTypes.length) {
-      const uploadErrors =
-        resultSummary?.summary?.upload_errors ||
-        resultSummary?.summary?.result?.upload_errors ||
-        resultSummary?.summary?.uploadErrors ||
-        {};
-
+      const uploadErrors = resultSummary?.summary?.upload_errors || {};
       throw new Error(
         `Missing stored artifact types: ${missingArtifactTypes.join(', ')}\n` +
         `Upload errors: ${JSON.stringify(uploadErrors, null, 2)}\n` +
@@ -1131,16 +1108,10 @@ async function main() {
       const t = item.artifactType || item.artifact_type;
       return t === 'summary' || t === 'config' || t === 'logs';
     });
-
     if (!downloadableArtifact?.downloadUrl && !downloadableArtifact?.download_url && !downloadableArtifact?.uri) {
       throw new Error('No downloadable artifact found');
     }
-
-    const downloadUrl =
-      downloadableArtifact.downloadUrl ||
-      downloadableArtifact.download_url ||
-      downloadableArtifact.uri;
-
+    const downloadUrl = downloadableArtifact.downloadUrl || downloadableArtifact.download_url || downloadableArtifact.uri;
     const artifactDownloadPath = path.join(workRoot, 'downloaded-artifact.bin');
     await downloadArtifact(downloadUrl, artifactDownloadPath, jwt);
     const downloadedStat = await fsp.stat(artifactDownloadPath);
@@ -1163,18 +1134,11 @@ async function main() {
     console.log(`HF repo: https://huggingface.co/${HF_REPO_TARGET}`);
     console.log(`HF files sample: ${hfFiles.slice(0, 20).join(', ')}`);
     console.log(`Workdir: ${workRoot}`);
-    if (!args.keepWorkdir) {
-      console.log('Temporary workdir will be deleted on exit.');
-    }
+    if (!args.keepWorkdir) console.log('Temporary workdir will be deleted on exit.');
   } finally {
-    if (backend?.child) {
-      await stopChild(backend.child);
-    }
-    if (!args.keepWorkdir) {
-      try {
-        await fsp.rm(workRoot, { recursive: true, force: true });
-      } catch {}
-    }
+    if (fixture?.server) await new Promise((resolve) => fixture.server.close(resolve));
+    if (backend?.child) await stopChild(backend.child);
+    if (!args.keepWorkdir) try { await fsp.rm(workRoot, { recursive: true, force: true }); } catch {}
   }
 }
 
