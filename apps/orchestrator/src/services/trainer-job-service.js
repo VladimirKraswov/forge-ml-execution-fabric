@@ -2,7 +2,7 @@
 
 const path = require('path');
 const { spawn } = require('child_process');
-const { db } = require('../db');
+const { db } = require('../infrastructure/db/db');
 const { CONFIG } = require('../config');
 const { newId } = require('../utils/ids');
 const { nowIso } = require('../utils/time');

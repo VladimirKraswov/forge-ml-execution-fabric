@@ -1,5 +1,5 @@
 const crypto = require('crypto');
-const { db } = require('../db');
+const { db } = require('../infrastructure/db/db');
 const { newId } = require('../utils/ids');
 const { nowIso } = require('../utils/time');
 const { parseJson, toJson } = require('../utils/json');
