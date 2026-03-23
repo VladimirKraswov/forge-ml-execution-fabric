@@ -50,6 +50,42 @@ def _normalize_tags(value: Any) -> List[str]:
         return [value.strip()]
     return []
 
+def _sanitize_tokenizer_config(model_dir: str) -> None:
+    model_path = Path(model_dir)
+    config_path = model_path / "tokenizer_config.json"
+
+    if not config_path.exists():
+        return
+
+    try:
+        with config_path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as exc:
+        logger.warning("failed to read tokenizer config %s: %s", config_path, exc)
+        return
+
+    changed = False
+
+    extra_special_tokens = data.get("extra_special_tokens")
+    if isinstance(extra_special_tokens, list):
+        additional = data.get("additional_special_tokens")
+        if not isinstance(additional, list):
+            additional = []
+
+        for token in extra_special_tokens:
+            token_str = str(token).strip()
+            if token_str and token_str not in additional:
+                additional.append(token_str)
+
+        data["additional_special_tokens"] = additional
+        data.pop("extra_special_tokens", None)
+        changed = True
+
+    if changed:
+        with config_path.open("w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        logger.info("sanitized tokenizer config: %s", config_path)
+
 
 def render_prompt_template(template: str, sample: Dict[str, Any]) -> str:
     tags = sample.get("hash_tags") or []
@@ -428,6 +464,7 @@ def _build_vllm_runtime(payload: Dict[str, Any]):
         "gpu_memory_utilization": float(eval_cfg.get("gpu_memory_utilization", 0.9)),
         "trust_remote_code": bool(model_cfg.get("trust_remote_code", False)),
         "enforce_eager": bool(eval_cfg.get("enforce_eager", False)),
+        "disable_log_stats": True,
     }
 
     if eval_cfg.get("max_num_seqs"):
@@ -443,6 +480,8 @@ def _build_vllm_runtime(payload: Dict[str, Any]):
         if not merged_dir or not Path(merged_dir).exists():
             raise ValueError("Merged model directory is missing, but evaluation.target='merged'")
 
+        _sanitize_tokenizer_config(str(merged_dir))
+
         model_label = str(merged_dir)
         llm = LLM(model=merged_dir, **engine_args)
         return llm, model_label, resolved_target, lora_request
@@ -454,6 +493,9 @@ def _build_vllm_runtime(payload: Dict[str, Any]):
     lora_dir = training_result.get("lora_dir")
     if not lora_dir or not Path(lora_dir).exists():
         raise ValueError("LoRA adapter directory is missing, but evaluation.target='lora'")
+
+    if Path(str(base_model)).exists():
+        _sanitize_tokenizer_config(str(base_model))
 
     engine_args["enable_lora"] = True
     engine_args["max_loras"] = 1

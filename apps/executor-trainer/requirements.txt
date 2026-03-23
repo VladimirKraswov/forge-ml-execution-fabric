@@ -4,7 +4,7 @@ unsloth-zoo
 bitsandbytes>=0.45.0
 xformers==0.0.35
 
-transformers>=4.48.0
+transformers>=4.48.0,<5
 datasets>=3.6.0
 accelerate>=1.10.1
 trl>=0.19.0
