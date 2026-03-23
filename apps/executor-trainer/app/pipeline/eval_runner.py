@@ -6,11 +6,9 @@ import logging
 import math
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 import torch
-from peft import PeftModel
-from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from ..adapters.reporter import Reporter
 from ..bootstrap.schemas import JobConfig
@@ -18,17 +16,40 @@ from ..bootstrap.schemas import JobConfig
 logger = logging.getLogger(__name__)
 
 
-def resolve_torch_dtype(dtype_value: str):
+def resolve_vllm_dtype(dtype_value: str) -> str:
     value = str(dtype_value or "auto").lower().strip()
-    if value == "auto":
-        return "auto"
-    if value in ("float16", "half", "fp16"):
-        return torch.float16
-    if value in ("bfloat16", "bf16"):
-        return torch.bfloat16
-    if value in ("float32", "float", "fp32"):
-        return torch.float32
+    if value in {"auto", "float16", "bfloat16", "float32"}:
+        return value
+    if value in {"half", "fp16"}:
+        return "float16"
+    if value in {"bf16"}:
+        return "bfloat16"
+    if value in {"float", "fp32"}:
+        return "float32"
     return "auto"
+
+
+def _get_by_path(payload: Dict[str, Any], path: Optional[str], default: Any = None) -> Any:
+    if not path:
+        return default
+
+    current: Any = payload
+    for part in str(path).split("."):
+        if isinstance(current, dict) and part in current:
+            current = current[part]
+        else:
+            return default
+    return current
+
+
+def _normalize_tags(value: Any) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [str(item) for item in value if str(item).strip()]
+    if isinstance(value, str) and value.strip():
+        return [value.strip()]
+    return []
 
 
 def render_prompt_template(template: str, sample: Dict[str, Any]) -> str:
@@ -48,11 +69,6 @@ def render_prompt_template(template: str, sample: Dict[str, Any]) -> str:
         rendered = rendered.replace(key, value)
 
     return rendered
-
-
-def extract_generated_text(tokenizer, prompt_text: str, output_ids, input_len: int) -> str:
-    generated_ids = output_ids[0][input_len:]
-    return tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
 
 
 def parse_model_score(
@@ -83,19 +99,20 @@ def parse_model_score(
     except Exception:
         pass
 
-    patterns = []
+    patterns: List[str] = []
     if parsing_regex:
         patterns.append(parsing_regex)
 
-    # Defaults
-    patterns.extend([
-        fr"score:\s*(\d+(?:\.\d+)?)\s*/\s*{int(score_max)}",
-        fr"оценка:\s*(\d+(?:\.\d+)?)\s*/\s*{int(score_max)}",
-        r"score:\s*(\d+(?:\.\d+)?)",
-        r"оценка:\s*(\d+(?:\.\d+)?)",
-        fr"(\d+(?:\.\d+)?)\s*/\s*{int(score_max)}",
-        r"^(\d+(?:\.\d+)?)$",
-    ])
+    patterns.extend(
+        [
+            fr"score:\s*(\d+(?:\.\d+)?)\s*/\s*{int(score_max)}",
+            fr"оценка:\s*(\d+(?:\.\d+)?)\s*/\s*{int(score_max)}",
+            r"score:\s*(\d+(?:\.\d+)?)",
+            r"оценка:\s*(\d+(?:\.\d+)?)",
+            fr"(\d+(?:\.\d+)?)\s*/\s*{int(score_max)}",
+            r"^(\d+(?:\.\d+)?)$",
+        ]
+    )
 
     for pattern in patterns:
         try:
@@ -119,6 +136,11 @@ def parse_model_score(
     }
 
 
+def _quadratic_score_error(predicted: float, reference: float) -> float:
+    # (v1^2 - v2^2)^2
+    return (float(predicted) ** 2 - float(reference) ** 2) ** 2
+
+
 def calculate_metrics(model_label: str, rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     valid_rows = [
         row
@@ -128,38 +150,53 @@ def calculate_metrics(model_label: str, rows: List[Dict[str, Any]]) -> Dict[str,
     total_samples = len(rows)
 
     if not valid_rows:
+        parse_ok = 0.0
         return {
             "model": model_label,
             "samples": total_samples,
-            "parseSuccessRate": 0.0,
+            "parseSuccessRate": parse_ok,
+            "parseOkRate": parse_ok,
+            "parseOk": parse_ok,
             "mae": None,
             "rmse": None,
             "exactRate": 0.0,
+            "exact": 0.0,
             "within1Rate": 0.0,
+            "plus1Rate": 0.0,
+            "plus1": 0.0,
             "within2Rate": 0.0,
+            "plus2Rate": 0.0,
+            "plus2": 0.0,
             "meanSignedError": None,
+            "bias": None,
             "avgPredictedScore": None,
+            "meanQuadraticScoreError": None,
             "parseErrors": sum(1 for row in rows if row.get("parseError")),
             "inferenceErrors": sum(1 for row in rows if row.get("inferenceError")),
             "emptyResponses": sum(1 for row in rows if not str(row.get("rawResponse") or "").strip()),
         }
 
     n = len(valid_rows)
-    abs_errors = []
-    sq_errors = []
-    signed_errors = []
+    abs_errors: List[float] = []
+    sq_errors: List[float] = []
+    signed_errors: List[float] = []
+    quadratic_errors: List[float] = []
     exact = 0
     within1 = 0
     within2 = 0
     predicted_sum = 0.0
 
     for row in valid_rows:
-        error = float(row["predictedScore"]) - float(row["referenceScore"])
+        predicted = float(row["predictedScore"])
+        reference = float(row["referenceScore"])
+        error = predicted - reference
         abs_error = abs(error)
+
         abs_errors.append(abs_error)
         sq_errors.append(error * error)
         signed_errors.append(error)
-        predicted_sum += float(row["predictedScore"])
+        quadratic_errors.append(_quadratic_score_error(predicted, reference))
+        predicted_sum += predicted
 
         if abs_error == 0:
             exact += 1
@@ -168,17 +205,32 @@ def calculate_metrics(model_label: str, rows: List[Dict[str, Any]]) -> Dict[str,
         if abs_error <= 2:
             within2 += 1
 
+    parse_ok = n / total_samples if total_samples else 0.0
+    bias = sum(signed_errors) / n
+    exact_rate = exact / n
+    plus1_rate = within1 / n
+    plus2_rate = within2 / n
+
     return {
         "model": model_label,
         "samples": total_samples,
-        "parseSuccessRate": n / total_samples if total_samples else 0.0,
+        "parseSuccessRate": parse_ok,
+        "parseOkRate": parse_ok,
+        "parseOk": parse_ok,
         "mae": sum(abs_errors) / n,
         "rmse": math.sqrt(sum(sq_errors) / n),
-        "exactRate": exact / n,
-        "within1Rate": within1 / n,
-        "within2Rate": within2 / n,
-        "meanSignedError": sum(signed_errors) / n,
+        "exactRate": exact_rate,
+        "exact": exact_rate,
+        "within1Rate": plus1_rate,
+        "plus1Rate": plus1_rate,
+        "plus1": plus1_rate,
+        "within2Rate": plus2_rate,
+        "plus2Rate": plus2_rate,
+        "plus2": plus2_rate,
+        "meanSignedError": bias,
+        "bias": bias,
         "avgPredictedScore": predicted_sum / n,
+        "meanQuadraticScoreError": sum(quadratic_errors) / n,
         "parseErrors": sum(1 for row in rows if row.get("parseError")),
         "inferenceErrors": sum(1 for row in rows if row.get("inferenceError")),
         "emptyResponses": sum(1 for row in rows if not str(row.get("rawResponse") or "").strip()),
@@ -221,31 +273,64 @@ def _normalize_eval_items(cfg: JobConfig) -> List[Dict[str, Any]]:
     normalized: List[Dict[str, Any]] = []
 
     for idx, item in enumerate(raw_items):
-        question = item.get(ds_cfg.question_field)
-        answer = item.get(ds_cfg.answer_field)
-        score = item.get(ds_cfg.score_field)
-        max_score = item.get(ds_cfg.max_score_field) if ds_cfg.max_score_field else 5
-        tags = item.get(ds_cfg.tags_field) if ds_cfg.tags_field else []
-
-        if question is None or answer is None or score is None:
+        score_raw = _get_by_path(item, ds_cfg.score_field)
+        if score_raw is None:
             continue
 
         try:
-            reference_score = float(score)
+            reference_score = float(score_raw)
         except Exception:
             continue
 
-        if not isinstance(tags, list):
-            tags = []
+        max_score_raw = _get_by_path(item, ds_cfg.max_score_field, 5) if ds_cfg.max_score_field else 5
+        try:
+            max_score = float(max_score_raw)
+        except Exception:
+            max_score = 5.0
+
+        tags = _normalize_tags(_get_by_path(item, ds_cfg.tags_field))
+
+        sample_id = (
+            item.get("id")
+            or _get_by_path(item, "details.plain_ind")
+            or _get_by_path(item, "details.question_ind")
+            or f"sample_{idx + 1}"
+        )
+
+        if ds_cfg.task == "score_prediction":
+            prompt_value = _get_by_path(item, ds_cfg.prompt_field)
+            messages_value = _get_by_path(item, ds_cfg.messages_field)
+
+            if prompt_value is None and messages_value is None:
+                continue
+
+            normalized.append(
+                {
+                    "id": str(sample_id),
+                    "prompt": str(prompt_value) if prompt_value is not None else None,
+                    "messages": messages_value if isinstance(messages_value, list) else None,
+                    "reference_score": reference_score,
+                    "max_score": max_score,
+                    "hash_tags": tags,
+                    "raw_item": item,
+                }
+            )
+            continue
+
+        question = _get_by_path(item, ds_cfg.question_field)
+        answer = _get_by_path(item, ds_cfg.answer_field)
+        if question is None or answer is None:
+            continue
 
         normalized.append(
             {
-                "id": item.get("id") or f"sample_{idx + 1}",
+                "id": str(sample_id),
                 "question": str(question),
                 "candidate_answer": str(answer),
                 "reference_score": reference_score,
-                "max_score": max_score if isinstance(max_score, (int, float)) else 5,
-                "hash_tags": [str(tag) for tag in tags],
+                "max_score": max_score,
+                "hash_tags": tags,
+                "raw_item": item,
             }
         )
 
@@ -255,46 +340,110 @@ def _normalize_eval_items(cfg: JobConfig) -> List[Dict[str, Any]]:
     return normalized
 
 
-def _build_prompt(tokenizer, template: str, sample: Dict[str, Any], system_prompt: Optional[str] = None) -> str:
-    rendered = render_prompt_template(template, sample)
-    messages = []
-    if system_prompt:
-        messages.append({"role": "system", "content": system_prompt})
-    messages.append({"role": "user", "content": rendered})
-
-    try:
-        return tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
-        )
-    except Exception:
-        return rendered
-
-
-def _load_eval_model(cfg: JobConfig, training_result: Dict[str, Any]) -> tuple[Any, Any, str]:
+def _resolve_eval_target(cfg: JobConfig, training_result: Dict[str, Any]) -> str:
     target = cfg.evaluation.target
     if target == "auto":
-        target = "merged" if training_result.get("merged_dir") else "lora"
+        return "merged" if training_result.get("merged_dir") else "lora"
+    return target
 
-    torch_dtype = resolve_torch_dtype(cfg.model.dtype)
 
-    if target == "merged":
+def _iter_batches(items: Sequence[Any], batch_size: int) -> Iterator[Tuple[int, Sequence[Any]]]:
+    batch_size = max(1, int(batch_size))
+    for start in range(0, len(items), batch_size):
+        yield start, items[start : start + batch_size]
+
+
+def _flatten_messages(messages: List[Dict[str, Any]]) -> str:
+    parts: List[str] = []
+    for msg in messages:
+        role = str(msg.get("role", "user")).upper()
+        content = str(msg.get("content", ""))
+        parts.append(f"{role}: {content}")
+    parts.append("ASSISTANT:")
+    return "\n".join(parts)
+
+
+def _build_score_prediction_prompt(cfg: JobConfig, sample: Dict[str, Any]) -> str:
+    messages = sample.get("messages")
+    if isinstance(messages, list) and messages:
+        return _flatten_messages(messages)
+
+    prompt_text = str(sample.get("prompt") or "")
+
+    if cfg.dataset.format == "instruction_output":
+        return f"### Instruction:\n{prompt_text}\n\n### Response:\n"
+
+    if cfg.dataset.format == "prompt_completion":
+        return prompt_text
+
+    if cfg.dataset.format == "messages":
+        return _flatten_messages([{"role": "user", "content": prompt_text}])
+
+    return prompt_text
+
+
+def _build_judge_prompt(cfg: JobConfig, sample: Dict[str, Any]) -> str:
+    rendered = render_prompt_template(
+        cfg.evaluation.prompt_template,
+        {
+            "question": sample["question"],
+            "candidate_answer": sample["candidate_answer"],
+            "reference_score": sample["reference_score"],
+            "max_score": sample["max_score"],
+            "hash_tags": sample["hash_tags"],
+        },
+    )
+
+    if cfg.evaluation.system_prompt:
+        return f"{cfg.evaluation.system_prompt}\n\n{rendered}"
+    return rendered
+
+
+def _extract_vllm_text(output: Any) -> str:
+    try:
+        outputs = getattr(output, "outputs", None) or []
+        if not outputs:
+            return ""
+        text = getattr(outputs[0], "text", "") or ""
+        return str(text).strip()
+    except Exception:
+        return ""
+
+
+def _build_vllm_runtime(cfg: JobConfig, training_result: Dict[str, Any]):
+    try:
+        from vllm import LLM
+        from vllm.lora.request import LoRARequest
+    except Exception as exc:
+        raise RuntimeError("vLLM is required for evaluation. Install 'vllm'.") from exc
+
+    resolved_target = _resolve_eval_target(cfg, training_result)
+    dtype = resolve_vllm_dtype(cfg.model.dtype)
+
+    engine_args: Dict[str, Any] = {
+        "tensor_parallel_size": max(1, int(cfg.evaluation.tensor_parallel_size)),
+        "dtype": dtype,
+        "gpu_memory_utilization": float(cfg.evaluation.gpu_memory_utilization),
+        "trust_remote_code": cfg.model.trust_remote_code,
+        "enforce_eager": bool(cfg.evaluation.enforce_eager),
+    }
+
+    if cfg.evaluation.max_num_seqs:
+        engine_args["max_num_seqs"] = int(cfg.evaluation.max_num_seqs)
+
+    if cfg.evaluation.max_num_batched_tokens:
+        engine_args["max_num_batched_tokens"] = int(cfg.evaluation.max_num_batched_tokens)
+
+    lora_request = None
+
+    if resolved_target == "merged":
         merged_dir = training_result.get("merged_dir")
         if not merged_dir or not Path(merged_dir).exists():
             raise ValueError("Merged model directory is missing, but evaluation.target='merged'")
+
         model_label = str(merged_dir)
-        tokenizer = AutoTokenizer.from_pretrained(
-            merged_dir,
-            trust_remote_code=cfg.model.trust_remote_code,
-        )
-        model = AutoModelForCausalLM.from_pretrained(
-            merged_dir,
-            device_map="auto",
-            torch_dtype=torch_dtype,
-            trust_remote_code=cfg.model.trust_remote_code,
-        )
-        return model, tokenizer, model_label
+        llm = LLM(model=merged_dir, **engine_args)
+        return llm, model_label, resolved_target, lora_request
 
     base_model = cfg.model.local_path if cfg.model.source == "local" else cfg.model.repo_id
     if not base_model:
@@ -304,22 +453,27 @@ def _load_eval_model(cfg: JobConfig, training_result: Dict[str, Any]) -> tuple[A
     if not lora_dir or not Path(lora_dir).exists():
         raise ValueError("LoRA adapter directory is missing, but evaluation.target='lora'")
 
-    model_kwargs = {
-        "device_map": "auto",
-        "torch_dtype": torch_dtype,
-        "trust_remote_code": cfg.model.trust_remote_code,
-    }
-    if cfg.model.load_in_4bit:
-        model_kwargs["load_in_4bit"] = True
+    engine_args["enable_lora"] = True
+    engine_args["max_loras"] = 1
+    engine_args["max_lora_rank"] = max(16, int(cfg.lora.r))
 
-    tokenizer = AutoTokenizer.from_pretrained(
-        base_model,
-        trust_remote_code=cfg.model.trust_remote_code,
-    )
-    model = AutoModelForCausalLM.from_pretrained(base_model, **model_kwargs)
-    model = PeftModel.from_pretrained(model, lora_dir)
+    llm = LLM(model=base_model, **engine_args)
+    lora_request = LoRARequest("eval_lora", 1, str(lora_dir))
 
-    return model, tokenizer, f"{base_model}+lora"
+    return llm, f"{base_model}+lora", resolved_target, lora_request
+
+
+def _build_eval_prompts(cfg: JobConfig, samples: Sequence[Dict[str, Any]]) -> List[str]:
+    ds_cfg = cfg.evaluation.dataset
+    assert ds_cfg is not None
+
+    prompts: List[str] = []
+    for sample in samples:
+        if ds_cfg.task == "score_prediction":
+            prompts.append(_build_score_prediction_prompt(cfg, sample))
+        else:
+            prompts.append(_build_judge_prompt(cfg, sample))
+    return prompts
 
 
 def run_evaluation(
@@ -330,22 +484,29 @@ def run_evaluation(
     if not cfg.evaluation.enabled:
         return {"enabled": False}
 
+    ds_cfg = cfg.evaluation.dataset
+    assert ds_cfg is not None
+
     if reporter:
         reporter.report_status(
             "running",
             stage="evaluation_prepare",
             progress=0,
             message="preparing evaluation",
+            extra={
+                "engine": cfg.evaluation.engine,
+                "task": ds_cfg.task,
+                "batch_size": cfg.evaluation.batch_size,
+                "max_num_seqs": cfg.evaluation.max_num_seqs,
+                "max_num_batched_tokens": cfg.evaluation.max_num_batched_tokens,
+            },
         )
 
     samples = _normalize_eval_items(cfg)
     if not samples:
         raise ValueError("Evaluation dataset is empty after normalization")
 
-    model, tokenizer, model_label = _load_eval_model(cfg, training_result)
-
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
+    llm, model_label, resolved_target, lora_request = _build_vllm_runtime(cfg, training_result)
 
     output_dir = Path(cfg.outputs.eval_dir) / cfg.job_name
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -359,54 +520,92 @@ def run_evaluation(
             stage="evaluation",
             progress=0,
             message="evaluation started",
-            extra={"samples": total, "model": model_label},
+            extra={
+                "samples": total,
+                "model": model_label,
+                "engine": cfg.evaluation.engine,
+                "target": resolved_target,
+                "task": ds_cfg.task,
+            },
         )
 
-    model.eval()
+    from vllm import SamplingParams
 
-    for index, sample in enumerate(samples, start=1):
-        prompt = _build_prompt(
-            tokenizer,
-            cfg.evaluation.prompt_template,
-            sample,
-            system_prompt=cfg.evaluation.system_prompt,
-        )
+    sampling_params = SamplingParams(
+        max_tokens=cfg.evaluation.max_new_tokens,
+        temperature=cfg.evaluation.temperature if cfg.evaluation.do_sample else 0.0,
+    )
 
-        row = {
-            "sampleId": sample["id"],
-            "question": sample["question"],
-            "candidateAnswer": sample["candidate_answer"],
-            "referenceScore": sample["reference_score"],
-            "maxScore": sample["max_score"],
-            "hashTags": sample["hash_tags"],
-            "predictedScore": None,
-            "predictedFeedback": None,
-            "rawResponse": None,
-            "parseError": True,
-            "inferenceError": False,
-            "absoluteError": None,
-        }
+    batch_size = max(1, int(cfg.evaluation.batch_size))
+
+    for start, batch in _iter_batches(samples, batch_size):
+        prompts = _build_eval_prompts(cfg, batch)
+
+        batch_rows: List[Dict[str, Any]] = []
+        for sample, prompt in zip(batch, prompts):
+            batch_rows.append(
+                {
+                    "sampleId": sample["id"],
+                    "inputText": prompt,
+                    "referenceScore": sample["reference_score"],
+                    "maxScore": sample["max_score"],
+                    "predictedScore": None,
+                    "absoluteError": None,
+                    "quadraticScoreError": None,
+                    "parseError": True,
+                    "inferenceError": False,
+                    "predictedFeedback": None,
+                    "rawResponse": None,
+                    "hashTags": sample.get("hash_tags") or [],
+                    "error": None,
+                }
+            )
 
         try:
-            encoded = tokenizer(prompt, return_tensors="pt")
-            model_inputs = {k: v.to(model.device) for k, v in encoded.items()}
-
-            with torch.no_grad():
-                output_ids = model.generate(
-                    **model_inputs,
-                    max_new_tokens=cfg.evaluation.max_new_tokens,
-                    do_sample=cfg.evaluation.do_sample,
-                    temperature=cfg.evaluation.temperature if cfg.evaluation.do_sample else 1.0,
-                    pad_token_id=tokenizer.pad_token_id,
-                    eos_token_id=tokenizer.eos_token_id,
-                )
-
-            raw_response = extract_generated_text(
-                tokenizer=tokenizer,
-                prompt_text=prompt,
-                output_ids=output_ids,
-                input_len=int(model_inputs["input_ids"].shape[1]),
+            outputs = llm.generate(
+                prompts,
+                sampling_params=sampling_params,
+                use_tqdm=False,
+                lora_request=lora_request,
             )
+        except Exception as exc:
+            error_text = str(exc)
+            logger.exception("evaluation batch failed: start=%s size=%s", start, len(batch))
+
+            for row in batch_rows:
+                row["rawResponse"] = ""
+                row["inferenceError"] = True
+                row["parseError"] = True
+                row["error"] = error_text
+
+            rows.extend(batch_rows)
+
+            processed = min(start + len(batch), total)
+            if reporter:
+                reporter.report_progress(
+                    stage="evaluation",
+                    progress=round((processed / total) * 100, 2),
+                    message=f"evaluated {processed}/{total} samples",
+                    extra={
+                        "processed": processed,
+                        "total": total,
+                        "model": model_label,
+                        "engine": cfg.evaluation.engine,
+                        "batch_failed": True,
+                        "error": error_text,
+                    },
+                )
+            continue
+
+        for idx, row in enumerate(batch_rows):
+            if idx >= len(outputs):
+                row["rawResponse"] = ""
+                row["inferenceError"] = True
+                row["parseError"] = True
+                row["error"] = "Missing output from vLLM"
+                continue
+
+            raw_response = _extract_vllm_text(outputs[idx])
 
             parsed = parse_model_score(
                 raw_response,
@@ -421,25 +620,26 @@ def run_evaluation(
             row["parseError"] = parsed["parseError"]
 
             if isinstance(parsed["score"], (int, float)):
-                row["absoluteError"] = abs(float(parsed["score"]) - float(sample["reference_score"]))
+                predicted = float(parsed["score"])
+                reference = float(row["referenceScore"])
+                row["absoluteError"] = abs(predicted - reference)
+                row["quadraticScoreError"] = _quadratic_score_error(predicted, reference)
 
-        except Exception as exc:
-            row["rawResponse"] = ""
-            row["inferenceError"] = True
-            row["parseError"] = True
-            row["error"] = str(exc)
+        rows.extend(batch_rows)
 
-        rows.append(row)
-
-        if reporter and (index == 1 or index == total or index % max(1, total // 10) == 0):
+        processed = min(start + len(batch), total)
+        if reporter:
             reporter.report_progress(
                 stage="evaluation",
-                progress=round((index / total) * 100, 2),
-                message=f"evaluated {index}/{total} samples",
+                progress=round((processed / total) * 100, 2),
+                message=f"evaluated {processed}/{total} samples",
                 extra={
-                    "processed": index,
+                    "processed": processed,
                     "total": total,
                     "model": model_label,
+                    "engine": cfg.evaluation.engine,
+                    "batch_size": len(batch),
+                    "max_num_seqs": cfg.evaluation.max_num_seqs,
                 },
             )
 
@@ -454,6 +654,9 @@ def run_evaluation(
         json.dump(
             {
                 "model": model_label,
+                "engine": cfg.evaluation.engine,
+                "target": resolved_target,
+                "task": ds_cfg.task,
                 "metrics": metrics,
                 "rows": rows,
             },
@@ -471,17 +674,26 @@ def run_evaluation(
             fieldnames=[
                 "model",
                 "samples",
-                "parseSuccessRate",
                 "mae",
                 "rmse",
-                "exactRate",
-                "within1Rate",
-                "within2Rate",
-                "meanSignedError",
+                "exact",
+                "plus1",
+                "plus2",
+                "bias",
+                "parseOk",
                 "avgPredictedScore",
+                "meanQuadraticScoreError",
                 "parseErrors",
                 "inferenceErrors",
                 "emptyResponses",
+                "parseSuccessRate",
+                "parseOkRate",
+                "exactRate",
+                "within1Rate",
+                "within2Rate",
+                "plus1Rate",
+                "plus2Rate",
+                "meanSignedError",
             ],
         )
         writer.writeheader()
@@ -490,17 +702,18 @@ def run_evaluation(
     with detailed_csv_path.open("w", encoding="utf-8", newline="") as f:
         fieldnames = [
             "sampleId",
-            "question",
-            "candidateAnswer",
+            "inputText",
             "referenceScore",
             "maxScore",
             "predictedScore",
             "absoluteError",
+            "quadraticScoreError",
             "parseError",
             "inferenceError",
             "hashTags",
             "predictedFeedback",
             "rawResponse",
+            "error",
         ]
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
@@ -508,23 +721,29 @@ def run_evaluation(
             writer.writerow(
                 {
                     "sampleId": row.get("sampleId"),
-                    "question": row.get("question"),
-                    "candidateAnswer": row.get("candidateAnswer"),
+                    "inputText": row.get("inputText"),
                     "referenceScore": row.get("referenceScore"),
                     "maxScore": row.get("maxScore"),
                     "predictedScore": row.get("predictedScore"),
                     "absoluteError": row.get("absoluteError"),
+                    "quadraticScoreError": row.get("quadraticScoreError"),
                     "parseError": row.get("parseError"),
                     "inferenceError": row.get("inferenceError"),
                     "hashTags": ", ".join(row.get("hashTags") or []),
                     "predictedFeedback": row.get("predictedFeedback"),
                     "rawResponse": row.get("rawResponse"),
+                    "error": row.get("error"),
                 }
             )
 
     try:
-        del model
-        torch.cuda.empty_cache()
+        del llm
+    except Exception:
+        pass
+
+    try:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
     except Exception:
         pass
 
@@ -539,7 +758,9 @@ def run_evaluation(
 
     return {
         "enabled": True,
-        "target": cfg.evaluation.target,
+        "engine": cfg.evaluation.engine,
+        "target": resolved_target,
+        "task": ds_cfg.task,
         "model": model_label,
         "summary": metrics,
         "summary_json_path": str(summary_json_path),

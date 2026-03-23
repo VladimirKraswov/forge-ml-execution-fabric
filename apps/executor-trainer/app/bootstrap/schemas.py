@@ -201,11 +201,25 @@ class EvaluationDatasetConfig(AppBaseModel):
     path: Optional[str] = None
     url: Optional[str] = None
     format: Literal["json", "jsonl"] = "jsonl"
+
+    # score_prediction:
+    #   модель получает prompt/input и должна выдать score
+    # judge:
+    #   старый режим question+answer -> judge prompt
+    task: Literal["score_prediction", "judge"] = "score_prediction"
+
+    # Для score_prediction
+    prompt_field: str = "input"
+    messages_field: Optional[str] = "messages"
+
+    # Для judge
     question_field: str = "question"
     answer_field: str = "candidate_answer"
-    score_field: str = "reference_score"
-    max_score_field: Optional[str] = "max_score"
-    tags_field: Optional[str] = "hash_tags"
+
+    # Общее
+    score_field: str = "output"
+    max_score_field: Optional[str] = None
+    tags_field: Optional[str] = "details.hash"
 
     @model_validator(mode="after")
     def validate_source(self) -> "EvaluationDatasetConfig":
@@ -220,7 +234,7 @@ class EvaluationConfig(AppBaseModel):
     enabled: bool = False
     target: Literal["auto", "lora", "merged"] = "auto"
     max_samples: Optional[int] = None
-    max_new_tokens: int = 128
+    max_new_tokens: int = 32
     temperature: float = 0.0
     do_sample: bool = False
     system_prompt: Optional[str] = None
@@ -229,6 +243,19 @@ class EvaluationConfig(AppBaseModel):
     score_min: float = 0.0
     score_max: float = 5.0
     dataset: Optional[EvaluationDatasetConfig] = None
+
+    # Новый eval engine
+    engine: Literal["vllm"] = "vllm"
+
+    # Сколько промптов отправлять одним чанком
+    batch_size: int = 16
+
+    # Настройки vLLM
+    tensor_parallel_size: int = 1
+    gpu_memory_utilization: float = 0.9
+    max_num_seqs: Optional[int] = None
+    max_num_batched_tokens: Optional[int] = None
+    enforce_eager: bool = False
 
     @model_validator(mode="after")
     def validate_enabled(self) -> "EvaluationConfig":

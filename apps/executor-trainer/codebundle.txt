@@ -1,7 +1,7 @@
 === CODE BUNDLE ===
-root: /Volumes/Extend/work/llm-lab/services/trainer-service
+root: /Volumes/Extend/work/forge-ml-execution-fabric/apps/executor-trainer
 ignore: .codebun)dleignore
-generated: 2026-03-22T13:48:11.070Z
+generated: 2026-03-23T08:43:21.235Z
 
 
 
@@ -19,813 +19,436 @@ CONFIG_REF=http://192.168.31.32:8010/files/job.remote.json
 HF_TOKEN=hf_xxx
 
 
-path: /app/archiver.py
+path: /app/__init__.py
+----------------------------------------
+
+
+
+path: /app/adapters/__init__.py
+----------------------------------------
+
+
+
+path: /app/adapters/hf_utils.py
 ----------------------------------------
 from __future__ import annotations
 
-import logging
-import tarfile
-from pathlib import Path
-from typing import Dict, Iterable, Optional
-
-import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
-
-logger = logging.getLogger(__name__)
-
-
-def build_retry_session(total_retries: int = 3) -> requests.Session:
-    retry = Retry(
-        total=total_retries,
-        connect=total_retries,
-        read=total_retries,
-        status=total_retries,
-        other=total_retries,
-        backoff_factor=1.0,
-        allowed_methods=None,
-        status_forcelist=[408, 425, 429, 500, 502, 503, 504],
-        raise_on_status=False,
-    )
-    adapter = HTTPAdapter(max_retries=retry)
-    session = requests.Session()
-    session.mount("http://", adapter)
-    session.mount("https://", adapter)
-    return session
-
-
-class Archiver:
-    def __init__(self, session: Optional[requests.Session] = None, retries: int = 3):
-        self.session = session or build_retry_session(retries)
-
-    def make_archive(
-        self,
-        source_dir: str,
-        output_filename: str,
-        exclude_names: Optional[Iterable[str]] = None,
-    ) -> str:
-        source_path = Path(source_dir).resolve()
-        output_path = Path(output_filename).resolve()
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-
-        excluded = set(exclude_names or set())
-        excluded.update({"downloads", "__pycache__"})
-
-        if output_path.parent == source_path:
-            excluded.add(output_path.name)
-
-        print(f"==> creating archive {output_path} from {source_path}")
-        with tarfile.open(output_path, "w:gz", compresslevel=1) as tar:
-            for item in source_path.iterdir():
-                if item.name in excluded:
-                    continue
-                if item.is_file() and item.name.endswith((".tar", ".tar.gz", ".tgz")):
-                    continue
-                tar.add(item, arcname=item.name)
-
-        return str(output_path)
-
-    def upload_archive(
-        self,
-        archive_path: str,
-        upload_url: str,
-        headers: Optional[Dict[str, str]] = None,
-        form_data: Optional[Dict[str, str]] = None,
-        timeout_sec: int = 120,
-    ) -> None:
-        print(f"==> uploading archive to {upload_url}")
-        with open(archive_path, "rb") as f:
-            files = {"file": (Path(archive_path).name, f, "application/gzip")}
-            response = self.session.post(
-                upload_url,
-                files=files,
-                data=form_data or {},
-                headers=headers or {},
-                timeout=(10, timeout_sec),
-            )
-            response.raise_for_status()
-        print("==> upload successful")
-
-
-path: /app/artifact_uploader.py
-----------------------------------------
-from __future__ import annotations
-
-import logging
-import re
-from pathlib import Path
-from typing import Any, Callable, Dict, Optional
+import os
+from typing import Optional
 
 from huggingface_hub import HfApi
 
-from archiver import Archiver
-from hf_utils import build_hf_api, get_hf_token
-from schemas import JobConfig
+
+def get_hf_token() -> Optional[str]:
+    return (
+        os.environ.get("HF_TOKEN")
+        or os.environ.get("HUGGINGFACE_HUB_TOKEN")
+        or os.environ.get("HUGGINGFACE_TOKEN")
+    )
+
+
+def build_hf_api() -> HfApi:
+    token = get_hf_token()
+    if not token:
+        raise RuntimeError("HF upload requested but HF_TOKEN is not set")
+    return HfApi(token=token)
+
+
+def validate_hf_token() -> dict:
+    api = build_hf_api()
+    return api.whoami()
+
+
+def try_hf_login() -> bool:
+    token = get_hf_token()
+    if not token:
+        print("==> HF_TOKEN not set, skip HF auth check")
+        return False
+
+    info = HfApi(token=token).whoami()
+    name = info.get("name") or info.get("fullname") or "unknown"
+    print(f"==> Hugging Face auth success: {name}")
+    return True
+
+
+path: /app/adapters/log_streamer.py
+----------------------------------------
+from __future__ import annotations
+
+import logging
+import queue
+import sys
+import threading
+import time
+from typing import Dict, Optional, Tuple
+
+import requests
+
+
+def _safe_timeout(timeout_sec: int | float | None, fallback: float = 3.0) -> Tuple[float, float]:
+    try:
+        value = float(timeout_sec or fallback)
+    except Exception:
+        value = fallback
+
+    read_timeout = max(1.0, min(value, 5.0))
+    connect_timeout = 2.0
+    return connect_timeout, read_timeout
+
+
+class LogStreamer(logging.Handler):
+    def __init__(
+        self,
+        logs_url: str,
+        job_id: str,
+        job_name: str,
+        bearer_token: Optional[str] = None,
+        timeout_sec: int = 5,
+    ):
+        super().__init__()
+        self.logs_url = str(logs_url or "").strip()
+        self.job_id = job_id
+        self.job_name = job_name
+        self.timeout_sec = timeout_sec
+
+        self.session = requests.Session()
+
+        self.offset_lock = threading.Lock()
+        self.offset = 0
+
+        self.headers: Dict[str, str] = {"Content-Type": "application/json"}
+        if bearer_token:
+            self.headers["Authorization"] = f"Bearer {bearer_token}"
+
+        self._queue: queue.Queue[dict] = queue.Queue(maxsize=2000)
+        self._stop_event = threading.Event()
+        self._worker = threading.Thread(
+            target=self._worker_loop,
+            name=f"log-streamer-{self.job_id}",
+            daemon=True,
+        )
+        self._worker.start()
+
+    def _deliver(self, payload: dict) -> None:
+        response = self.session.post(
+            self.logs_url,
+            json=payload,
+            headers=self.headers,
+            timeout=_safe_timeout(self.timeout_sec, 3.0),
+        )
+        response.raise_for_status()
+
+    def _worker_loop(self) -> None:
+        while not self._stop_event.is_set() or not self._queue.empty():
+            try:
+                payload = self._queue.get(timeout=0.2)
+            except queue.Empty:
+                continue
+
+            try:
+                self._deliver(payload)
+            except Exception as exc:
+                try:
+                    sys.stderr.write(f"[log-streamer] failed to send log chunk: {exc}\n")
+                    sys.stderr.flush()
+                except Exception:
+                    pass
+            finally:
+                self._queue.task_done()
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            message = self.format(record)
+            if not message:
+                return
+
+            chunk = f"{message}\n"
+            encoded = chunk.encode("utf-8", errors="replace")
+
+            with self.offset_lock:
+                current_offset = self.offset
+                self.offset += len(encoded)
+
+            payload = {
+                "job_id": self.job_id,
+                "job_name": self.job_name,
+                "offset": current_offset,
+                "chunk": chunk,
+            }
+
+            try:
+                self._queue.put_nowait(payload)
+            except queue.Full:
+                try:
+                    sys.stderr.write("[log-streamer] queue is full, dropping log chunk\n")
+                    sys.stderr.flush()
+                except Exception:
+                    pass
+        except Exception as exc:
+            try:
+                sys.stderr.write(f"[log-streamer] emit failed: {exc}\n")
+                sys.stderr.flush()
+            except Exception:
+                pass
+
+    def flush(self, timeout_sec: float = 3.0) -> None:
+        deadline = time.time() + max(0.0, timeout_sec)
+        while time.time() < deadline:
+            if self._queue.empty():
+                return
+            time.sleep(0.05)
+
+    def close(self) -> None:
+        try:
+            self.flush(timeout_sec=2.0)
+            self._stop_event.set()
+            self._worker.join(timeout=2.0)
+        finally:
+            try:
+                self.session.close()
+            except Exception:
+                pass
+            super().close()
+
+
+path: /app/adapters/reporter.py
+----------------------------------------
+from __future__ import annotations
+
+import copy
+import logging
+import queue
+import threading
+import time
+from typing import Any, Dict, List, Tuple
+
+import requests
+
+from ..bootstrap.schemas import CallbackConfig, JobConfig
 
 logger = logging.getLogger(__name__)
 
 
-class ArtifactUploader:
+def _safe_timeout(timeout_sec: int | float | None, fallback: float = 3.0) -> Tuple[float, float]:
+    try:
+        value = float(timeout_sec or fallback)
+    except Exception:
+        value = fallback
+
+    read_timeout = max(1.0, min(value, 5.0))
+    connect_timeout = 2.0
+    return connect_timeout, read_timeout
+
+
+class Reporter:
     def __init__(self, cfg: JobConfig):
         self.cfg = cfg
-        self.archiver = Archiver()
-        self.session = self.archiver.session
+        self.job_name = cfg.job_name
+        self.job_id = cfg.job_id or cfg.job_name
 
-    def _headers(self) -> Dict[str, str]:
-        headers: Dict[str, str] = {}
-        if self.cfg.upload.auth.headers:
-            headers.update(self.cfg.upload.auth.headers)
-        if self.cfg.upload.auth.bearer_token:
-            headers["Authorization"] = f"Bearer {self.cfg.upload.auth.bearer_token}"
+        self.session = requests.Session()
+
+        self._queue: queue.Queue[Tuple[str, CallbackConfig, Dict[str, Any]]] = queue.Queue(maxsize=1000)
+        self._stop_event = threading.Event()
+        self._worker = threading.Thread(
+            target=self._worker_loop,
+            name=f"reporter-{self.job_id}",
+            daemon=True,
+        )
+        self._worker.start()
+
+    def _build_headers(self, callback: CallbackConfig) -> Dict[str, str]:
+        headers: Dict[str, str] = {"Content-Type": "application/json"}
+        if callback.auth.headers:
+            headers.update(callback.auth.headers)
+        if callback.auth.bearer_token:
+            headers["Authorization"] = f"Bearer {callback.auth.bearer_token}"
         return headers
 
-    @staticmethod
-    def _is_probably_local_model_ref(value: str) -> bool:
-        value = str(value or "").strip()
-        if not value:
-            return False
-        if value.startswith("/"):
-            return True
-        if value.startswith("./") or value.startswith("../"):
-            return True
-        if value.startswith("\\") or "\\" in value:
-            return True
-        if len(value) > 1 and value[1] == ":":
-            return True
-        return False
+    def _callbacks_for(self, event_kind: str) -> List[CallbackConfig]:
+        callbacks: List[CallbackConfig] = []
 
-    def _resolve_hf_base_model_id(
-        self,
-        training_result: Optional[Dict[str, Any]] = None,
-    ) -> Optional[str]:
-        candidates = []
+        if event_kind == "status" and self.cfg.reporting.status.active:
+            callbacks.append(self.cfg.reporting.status)
+        elif event_kind == "progress" and self.cfg.reporting.progress.active:
+            callbacks.append(self.cfg.reporting.progress)
+        elif event_kind == "final" and self.cfg.reporting.final.active:
+            callbacks.append(self.cfg.reporting.final)
 
-        if training_result:
-            candidates.extend(
-                [
-                    training_result.get("base_model_id"),
-                    training_result.get("base_model_name_or_path"),
-                    training_result.get("base_model"),
-                ]
-            )
-            summary = training_result.get("summary") or {}
-            if isinstance(summary, dict):
-                candidates.extend(
-                    [
-                        summary.get("base_model_id"),
-                        summary.get("base_model_name_or_path"),
-                        summary.get("base_model"),
-                    ]
+        if not callbacks and self.cfg.report_url:
+            callbacks.append(
+                CallbackConfig(
+                    enabled=True,
+                    url=self.cfg.report_url,
+                    timeout_sec=5,
                 )
-
-        candidates.extend(
-            [
-                self.cfg.model.logical_base_model_id,
-                self.cfg.model.repo_id,
-                self.cfg.model.base_model_name_or_path,
-                self.cfg.model.base_model,
-            ]
-        )
-
-        for candidate in candidates:
-            if not isinstance(candidate, str):
-                continue
-            value = candidate.strip()
-            if not value:
-                continue
-            if self._is_probably_local_model_ref(value):
-                continue
-            return value
-
-        return None
-
-    def _rewrite_readme_frontmatter_base_model(
-        self,
-        readme_path: Path,
-        base_model_id: Optional[str],
-    ) -> bool:
-        if not readme_path.exists():
-            return False
-
-        original = readme_path.read_text(encoding="utf-8")
-        newline = "\r\n" if "\r\n" in original else "\n"
-        had_trailing_newline = original.endswith("\n") or original.endswith("\r")
-
-        def finalize(parts: list[str]) -> str:
-            text = newline.join(parts)
-            if had_trailing_newline and not text.endswith(newline):
-                text += newline
-            return text
-
-        lines = original.splitlines()
-
-        if lines and lines[0].strip() == "---":
-            frontmatter_end = None
-            for idx in range(1, len(lines)):
-                if lines[idx].strip() == "---":
-                    frontmatter_end = idx
-                    break
-
-            if frontmatter_end is not None:
-                header_lines = lines[1:frontmatter_end]
-                body_lines = lines[frontmatter_end + 1 :]
-
-                updated_header: list[str] = []
-                found_base_model = False
-                changed = False
-
-                for line in header_lines:
-                    if re.match(r"^\s*base_model\s*:", line):
-                        found_base_model = True
-                        if base_model_id:
-                            replacement = f"base_model: {base_model_id}"
-                            updated_header.append(replacement)
-                            if line != replacement:
-                                changed = True
-                        else:
-                            changed = True
-                        continue
-                    updated_header.append(line)
-
-                if base_model_id and not found_base_model:
-                    updated_header.append(f"base_model: {base_model_id}")
-                    changed = True
-
-                if not changed:
-                    return False
-
-                updated = finalize(["---", *updated_header, "---", *body_lines])
-                readme_path.write_text(updated, encoding="utf-8")
-                return True
-
-        if not base_model_id:
-            return False
-
-        updated = f"---{newline}base_model: {base_model_id}{newline}---{newline}{newline}{original}"
-        readme_path.write_text(updated, encoding="utf-8")
-        return True
-
-    def _normalize_model_card_metadata(
-        self,
-        folder_path: str,
-        training_result: Optional[Dict[str, Any]] = None,
-    ) -> None:
-        repo_dir = Path(folder_path)
-        readme_path = repo_dir / "README.md"
-        if not readme_path.exists():
-            return
-
-        base_model_id = self._resolve_hf_base_model_id(training_result)
-        changed = self._rewrite_readme_frontmatter_base_model(readme_path, base_model_id)
-        if changed:
-            logger.info(
-                "==> normalized README.md metadata in %s (base_model=%s)",
-                readme_path,
-                base_model_id or "<removed>",
             )
 
-    def _upload_file(self, file_path: str, upload_url: str, artifact_type: str) -> Dict[str, str]:
-        path = Path(file_path)
-        if not upload_url or not path.exists():
-            return {}
+        return callbacks
 
-        with path.open("rb") as f:
-            files = {"file": (path.name, f, "application/octet-stream")}
-            data = {
-                "job_id": self.cfg.job_id or self.cfg.job_name,
-                "job_name": self.cfg.job_name,
-                "artifact_type": artifact_type,
-            }
-            response = self.session.post(
-                upload_url,
-                files=files,
-                data=data,
-                headers=self._headers(),
-                timeout=(10, self.cfg.upload.timeout_sec),
-            )
-            response.raise_for_status()
-
-        return {"url": upload_url, "path": str(path)}
-
-    def _archive_and_upload_dir(
-        self,
-        dir_path: str,
-        upload_url: str,
-        archive_name: str,
-        artifact_type: str,
-    ) -> Dict[str, str]:
-        path = Path(dir_path)
-        if not upload_url or not path.exists():
-            return {}
-
-        archive_path = Path(self.cfg.outputs.base_dir) / archive_name
-        self.archiver.make_archive(
-            str(path),
-            str(archive_path),
-            exclude_names={"downloads", "__pycache__"},
+    def _deliver(self, event_kind: str, callback: CallbackConfig, payload: Dict[str, Any]) -> None:
+        logger.info("==> reporting %s to %s", event_kind, callback.url)
+        response = self.session.post(
+            callback.url,
+            json=payload,
+            headers=self._build_headers(callback),
+            timeout=_safe_timeout(callback.timeout_sec, 3.0),
         )
-        self.archiver.upload_archive(
-            str(archive_path),
-            upload_url,
-            headers=self._headers(),
-            form_data={
-                "job_id": self.cfg.job_id or self.cfg.job_name,
-                "job_name": self.cfg.job_name,
-                "artifact_type": artifact_type,
-            },
-            timeout_sec=self.cfg.upload.timeout_sec,
-        )
-        return {"url": upload_url, "archive_path": str(archive_path)}
+        response.raise_for_status()
 
-    def _safe_upload(
-        self,
-        key: str,
-        operation: Callable[[], Dict[str, str]],
-        uploaded: Dict[str, Dict[str, str]],
-        errors: Dict[str, str],
-    ) -> None:
+    def _enqueue(self, event_kind: str, callback: CallbackConfig, payload: Dict[str, Any]) -> None:
+        item = (event_kind, callback, copy.deepcopy(payload))
         try:
-            result = operation()
-            if result:
-                uploaded[key] = result
-        except Exception as exc:
-            logger.exception("upload step failed: %s", key)
-            errors[key] = str(exc)
+            self._queue.put_nowait(item)
+        except queue.Full:
+            logger.warning("reporter queue is full, dropping %s callback to %s", event_kind, callback.url)
 
-    def upload_non_summary_artifacts(
+    def _worker_loop(self) -> None:
+        while not self._stop_event.is_set() or not self._queue.empty():
+            try:
+                event_kind, callback, payload = self._queue.get(timeout=0.2)
+            except queue.Empty:
+                continue
+
+            try:
+                self._deliver(event_kind, callback, payload)
+            except Exception as exc:
+                logger.warning("failed to report %s: %s", event_kind, exc)
+            finally:
+                self._queue.task_done()
+
+    def _emit(
         self,
-        log_file: str,
-        effective_config_path: str,
-        training_result: Dict,
-        eval_result: Optional[Dict] = None,
-    ) -> tuple[Dict[str, Dict[str, str]], Dict[str, str]]:
-        uploaded: Dict[str, Dict[str, str]] = {}
-        errors: Dict[str, str] = {}
+        event_kind: str,
+        payload: Dict[str, Any],
+        *,
+        synchronous: bool = False,
+    ) -> None:
+        callbacks = self._callbacks_for(event_kind)
+        if not callbacks:
+            return
 
-        if self.cfg.upload.enabled and self.cfg.upload.target == "url":
-            targets = self.cfg.upload.url_targets
-
-            if targets.logs_url:
-                self._safe_upload(
-                    "logs",
-                    lambda: self._upload_file(log_file, targets.logs_url, "logs"),
-                    uploaded,
-                    errors,
-                )
-
-            if targets.effective_config_url:
-                self._safe_upload(
-                    "effective_config",
-                    lambda: self._upload_file(
-                        effective_config_path,
-                        targets.effective_config_url,
-                        "config",
-                    ),
-                    uploaded,
-                    errors,
-                )
-
-            metrics_path = training_result.get("metrics_path")
-            if targets.train_metrics_url and metrics_path:
-                self._safe_upload(
-                    "train_metrics",
-                    lambda: self._upload_file(
-                        metrics_path,
-                        targets.train_metrics_url,
-                        "train_metrics",
-                    ),
-                    uploaded,
-                    errors,
-                )
-
-            history_path = training_result.get("history_path")
-            if targets.train_history_url and history_path:
-                self._safe_upload(
-                    "train_history",
-                    lambda: self._upload_file(
-                        history_path,
-                        targets.train_history_url,
-                        "train_history",
-                    ),
-                    uploaded,
-                    errors,
-                )
-
-            lora_dir = training_result.get("lora_dir")
-            if targets.lora_archive_url and lora_dir:
-                self._safe_upload(
-                    "lora_archive",
-                    lambda: self._archive_and_upload_dir(
-                        lora_dir,
-                        targets.lora_archive_url,
-                        f"{self.cfg.job_name}.lora.tar.gz",
-                        "lora_archive",
-                    ),
-                    uploaded,
-                    errors,
-                )
-
-            merged_dir = training_result.get("merged_dir")
-            if targets.merged_archive_url and merged_dir and Path(merged_dir).exists():
-                self._safe_upload(
-                    "merged_archive",
-                    lambda: self._archive_and_upload_dir(
-                        merged_dir,
-                        targets.merged_archive_url,
-                        f"{self.cfg.job_name}.merged.tar.gz",
-                        "merged_archive",
-                    ),
-                    uploaded,
-                    errors,
-                )
-
-            if targets.full_archive_url:
-                self._safe_upload(
-                    "full_archive",
-                    lambda: self._archive_and_upload_dir(
-                        self.cfg.outputs.base_dir,
-                        targets.full_archive_url,
-                        f"{self.cfg.job_name}.full.tar.gz",
-                        "full_archive",
-                    ),
-                    uploaded,
-                    errors,
-                )
-
-            if eval_result:
-                if targets.eval_summary_url and eval_result.get("summary_json_path"):
-                    self._safe_upload(
-                        "eval_summary",
-                        lambda: self._upload_file(
-                            eval_result["summary_json_path"],
-                            targets.eval_summary_url,
-                            "evaluation_summary",
-                        ),
-                        uploaded,
-                        errors,
-                    )
-
-                if targets.eval_details_url and eval_result.get("detailed_csv_path"):
-                    self._safe_upload(
-                        "eval_details",
-                        lambda: self._upload_file(
-                            eval_result["detailed_csv_path"],
-                            targets.eval_details_url,
-                            "evaluation_details",
-                        ),
-                        uploaded,
-                        errors,
-                    )
-
-        return uploaded, errors
-
-    def upload_summary(self, summary_path: str) -> Dict[str, Dict[str, str]]:
-        uploaded: Dict[str, Dict[str, str]] = {}
-        if (
-            self.cfg.upload.enabled
-            and self.cfg.upload.target == "url"
-            and self.cfg.upload.url_targets.summary_url
-        ):
-            uploaded["summary"] = self._upload_file(
-                summary_path,
-                self.cfg.upload.url_targets.summary_url,
-                "job_summary",
-            )
-        return uploaded
-
-    def _hf_plan(self) -> Dict[str, Any]:
-        lora_repo = self.cfg.huggingface.repo_id_lora or self.cfg.upload.repo_id_lora
-        merged_repo = self.cfg.huggingface.repo_id_merged or self.cfg.upload.repo_id_merged
-        metadata_repo = (
-            self.cfg.huggingface.repo_id_metadata
-            or self.cfg.upload.repo_id_metadata
-            or lora_repo
-            or merged_repo
-        )
-
-        request_lora = bool(
-            lora_repo and (
-                self.cfg.huggingface.push_lora
-                or self.cfg.upload.target == "huggingface"
-            )
-        )
-        request_merged = bool(
-            merged_repo and (
-                self.cfg.huggingface.push_merged
-                or self.cfg.upload.target == "huggingface"
-            )
-        )
-        request_metadata = bool(
-            metadata_repo and (
-                self.cfg.huggingface.enabled
-                or self.cfg.upload.target == "huggingface"
-                or request_lora
-                or request_merged
-            )
-        )
-
-        private = (
-            self.cfg.huggingface.private
-            if self.cfg.huggingface.enabled
-            else self.cfg.upload.private
-        )
-        commit_message = (
-            self.cfg.huggingface.commit_message
-            if self.cfg.huggingface.enabled
-            else self.cfg.upload.commit_message
-        )
-        revision = self.cfg.huggingface.revision
-
-        return {
-            "request_lora": request_lora,
-            "request_merged": request_merged,
-            "request_metadata": request_metadata,
-            "lora_repo": lora_repo,
-            "merged_repo": merged_repo,
-            "metadata_repo": metadata_repo,
-            "private": private,
-            "commit_message": commit_message,
-            "revision": revision,
+        payload = {
+            "job_id": self.job_id,
+            "job_name": self.job_name,
+            "event": event_kind,
+            "timestamp": time.time(),
+            **payload,
         }
 
-    def ensure_hf_ready(self) -> Dict[str, Any]:
-        plan = self._hf_plan()
+        for callback in callbacks:
+            if synchronous:
+                try:
+                    self._deliver(event_kind, callback, payload)
+                except Exception as exc:
+                    logger.warning("failed to report %s: %s", event_kind, exc)
+            else:
+                self._enqueue(event_kind, callback, payload)
 
-        if not plan["request_lora"] and not plan["request_merged"] and not plan["request_metadata"]:
-            return plan
-
-        if not get_hf_token():
-            raise RuntimeError("Hugging Face upload is requested, but HF_TOKEN is missing")
-
-        if plan["request_lora"] and not plan["lora_repo"]:
-            raise RuntimeError("LoRA upload is requested, but repo_id_lora is missing")
-
-        if plan["request_merged"] and not plan["merged_repo"]:
-            raise RuntimeError("Merged upload is requested, but repo_id_merged is missing")
-
-        if plan["request_metadata"] and not plan["metadata_repo"]:
-            raise RuntimeError("Metadata upload is requested, but metadata repo cannot be resolved")
-
-        api = build_hf_api()
-        whoami = api.whoami()
-        logger.info("==> Hugging Face upload ready for account: %s", whoami.get("name") or "unknown")
-        return plan
-
-    def upload_to_huggingface(self, training_result: Dict) -> Dict[str, Dict[str, str]]:
-        uploaded: Dict[str, Dict[str, str]] = {}
-        plan = self._hf_plan()
-
-        if not plan["request_lora"] and not plan["request_merged"]:
-            return uploaded
-
-        api = build_hf_api()
-
-        if plan["request_lora"]:
-            lora_dir = training_result.get("lora_dir")
-            if not lora_dir or not Path(lora_dir).exists():
-                raise RuntimeError("LoRA upload requested but lora_dir is missing")
-
-            self._normalize_model_card_metadata(lora_dir, training_result)
-
-            api.create_repo(
-                repo_id=plan["lora_repo"],
-                repo_type="model",
-                private=plan["private"],
-                exist_ok=True,
-            )
-            api.upload_folder(
-                repo_id=plan["lora_repo"],
-                repo_type="model",
-                folder_path=lora_dir,
-                commit_message=plan["commit_message"],
-                revision=plan["revision"],
-                ignore_patterns=["__pycache__/**", "*.tmp", "*.log"],
-            )
-            uploaded["hf_lora"] = {"repo_id": plan["lora_repo"], "path": lora_dir}
-
-        if plan["request_merged"]:
-            merged_dir = training_result.get("merged_dir")
-            if not merged_dir or not Path(merged_dir).exists():
-                raise RuntimeError("Merged upload requested but merged_dir is missing")
-
-            self._normalize_model_card_metadata(merged_dir, training_result)
-
-            api.create_repo(
-                repo_id=plan["merged_repo"],
-                repo_type="model",
-                private=plan["private"],
-                exist_ok=True,
-            )
-            api.upload_folder(
-                repo_id=plan["merged_repo"],
-                repo_type="model",
-                folder_path=merged_dir,
-                commit_message=plan["commit_message"],
-                revision=plan["revision"],
-                ignore_patterns=["__pycache__/**", "*.tmp", "*.log"],
-            )
-            uploaded["hf_merged"] = {"repo_id": plan["merged_repo"], "path": merged_dir}
-
-        return uploaded
-
-    def _upload_file_to_hf(
+    def report_status(
         self,
-        api: HfApi,
-        repo_id: str,
-        file_path: str,
-        path_in_repo: str,
-        commit_message: str,
-        revision: Optional[str] = None,
-    ) -> Optional[str]:
-        path = Path(file_path)
-        if not path.exists():
-            return None
-
-        api.upload_file(
-            path_or_fileobj=str(path),
-            path_in_repo=path_in_repo,
-            repo_id=repo_id,
-            repo_type="model",
-            commit_message=commit_message,
-            revision=revision,
-        )
-        return path_in_repo
-
-    def upload_hf_metadata(
-        self,
-        log_file: str,
-        effective_config_path: str,
-        result_path: str,
-        training_result: Dict,
-        eval_result: Optional[Dict] = None,
-    ) -> Dict[str, Dict[str, Any]]:
-        uploaded: Dict[str, Dict[str, Any]] = {}
-        plan = self._hf_plan()
-
-        if not plan["request_metadata"]:
-            return uploaded
-
-        repo_id = plan["metadata_repo"]
-        if not repo_id:
-            return uploaded
-
-        api = build_hf_api()
-        api.create_repo(
-            repo_id=repo_id,
-            repo_type="model",
-            private=plan["private"],
-            exist_ok=True,
+        status: str,
+        message: str | None = None,
+        stage: str | None = None,
+        progress: float | None = None,
+        extra: Dict[str, Any] | None = None,
+        logs: str | None = None,
+    ) -> None:
+        self._emit(
+            "status",
+            {
+                "status": status,
+                "stage": stage,
+                "progress": progress,
+                "message": message,
+                "logs": logs,
+                "extra": extra or {},
+            },
+            synchronous=False,
         )
 
-        commit_message = f"{plan['commit_message']} (metadata)"
-        revision = plan["revision"]
+    def report_progress(
+        self,
+        stage: str,
+        progress: float | None = None,
+        message: str | None = None,
+        extra: Dict[str, Any] | None = None,
+    ) -> None:
+        self._emit(
+            "progress",
+            {
+                "status": "running",
+                "stage": stage,
+                "progress": progress,
+                "message": message,
+                "extra": extra or {},
+            },
+            synchronous=False,
+        )
 
-        uploaded_files: list[str] = []
+    def report_final(self, result: Dict[str, Any], status: str = "finished") -> None:
+        self._emit(
+            "final",
+            {
+                "status": status,
+                "result": result,
+            },
+            synchronous=True,
+        )
 
-        file_specs = [
-            (log_file, "artifacts/logs/trainer.log"),
-            (effective_config_path, "artifacts/config/effective-job.json"),
-            (result_path, "artifacts/result/job-result.json"),
-        ]
+    def report_error(
+        self,
+        error_message: str,
+        logs: str | None = None,
+        stage: str = "failed",
+        extra: Dict[str, Any] | None = None,
+    ) -> None:
+        self._emit(
+            "status",
+            {
+                "status": "failed",
+                "stage": stage,
+                "progress": 100,
+                "message": error_message,
+                "logs": logs,
+                "extra": extra or {},
+            },
+            synchronous=True,
+        )
 
-        if training_result.get("metrics_path"):
-            file_specs.append(
-                (training_result["metrics_path"], "artifacts/train/train_metrics.json")
-            )
-        if training_result.get("history_path"):
-            file_specs.append(
-                (training_result["history_path"], "artifacts/train/train_history.json")
-            )
-        if training_result.get("train_summary_path"):
-            file_specs.append(
-                (training_result["train_summary_path"], "artifacts/train/train_summary.json")
-            )
+    def flush(self, timeout_sec: float = 5.0) -> None:
+        deadline = time.time() + max(0.0, timeout_sec)
+        while time.time() < deadline:
+            if self._queue.empty():
+                return
+            time.sleep(0.05)
 
-        if eval_result:
-            if eval_result.get("summary_json_path"):
-                file_specs.append(
-                    (eval_result["summary_json_path"], "artifacts/evaluation/summary.json")
-                )
-            if eval_result.get("result_json_path"):
-                file_specs.append(
-                    (eval_result["result_json_path"], "artifacts/evaluation/result.json")
-                )
-            if eval_result.get("summary_csv_path"):
-                file_specs.append(
-                    (eval_result["summary_csv_path"], "artifacts/evaluation/summary.csv")
-                )
-            if eval_result.get("detailed_csv_path"):
-                file_specs.append(
-                    (eval_result["detailed_csv_path"], "artifacts/evaluation/detailed.csv")
-                )
-
-        for local_path, path_in_repo in file_specs:
-            uploaded_path = self._upload_file_to_hf(
-                api=api,
-                repo_id=repo_id,
-                file_path=local_path,
-                path_in_repo=path_in_repo,
-                commit_message=commit_message,
-                revision=revision,
-            )
-            if uploaded_path:
-                uploaded_files.append(uploaded_path)
-
-        uploaded["hf_metadata"] = {
-            "repo_id": repo_id,
-            "files": uploaded_files,
-        }
-        return uploaded
+    def close(self) -> None:
+        try:
+            self.flush(timeout_sec=3.0)
+            self._stop_event.set()
+            self._worker.join(timeout=2.0)
+        finally:
+            try:
+                self.session.close()
+            except Exception:
+                pass
 
 
-path: /app/asset_manager.py
+path: /app/bootstrap/__init__.py
 ----------------------------------------
-from __future__ import annotations
-
-from pathlib import Path
-from urllib.parse import urlparse
-
-import requests
-
-from schemas import JobConfig
 
 
-class AssetManager:
-    def __init__(self, cfg: JobConfig):
-        self.cfg = cfg
-        self.download_dir = Path(cfg.outputs.downloads_dir)
 
-    def _infer_suffix(self, url: str, default_suffix: str = ".json") -> str:
-        parsed = urlparse(url)
-        suffix = Path(parsed.path).suffix
-        return suffix or default_suffix
-
-    def download_file(self, url: str, dest_path: Path) -> Path:
-        print(f"==> downloading {url} to {dest_path}")
-        dest_path.parent.mkdir(parents=True, exist_ok=True)
-
-        with requests.get(url, stream=True, timeout=120) as response:
-            response.raise_for_status()
-            with dest_path.open("wb") as f:
-                for chunk in response.iter_content(chunk_size=1024 * 1024):
-                    if chunk:
-                        f.write(chunk)
-
-        return dest_path
-
-    def prepare_dataset(self, cfg: JobConfig) -> None:
-        if cfg.dataset.source != "url":
-            return
-
-        dataset_dir = self.download_dir / "dataset"
-        dataset_dir.mkdir(parents=True, exist_ok=True)
-
-        if cfg.dataset.train_url:
-            train_suffix = self._infer_suffix(cfg.dataset.train_url, ".json")
-            train_path = dataset_dir / f"train{train_suffix}"
-            self.download_file(cfg.dataset.train_url, train_path)
-            cfg.dataset.train_path = str(train_path)
-
-        if cfg.dataset.val_url:
-            val_suffix = self._infer_suffix(cfg.dataset.val_url, ".json")
-            val_path = dataset_dir / f"val{val_suffix}"
-            self.download_file(cfg.dataset.val_url, val_path)
-            cfg.dataset.val_path = str(val_path)
-
-        print("==> dataset prepared")
-
-    def prepare_evaluation_dataset(self, cfg: JobConfig) -> None:
-        if not cfg.evaluation.enabled or not cfg.evaluation.dataset:
-            return
-
-        eval_cfg = cfg.evaluation.dataset
-        if eval_cfg.source != "url" or not eval_cfg.url:
-            return
-
-        eval_dir = self.download_dir / "evaluation"
-        eval_dir.mkdir(parents=True, exist_ok=True)
-
-        eval_suffix = self._infer_suffix(
-            eval_cfg.url,
-            ".jsonl" if eval_cfg.format == "jsonl" else ".json",
-        )
-        eval_path = eval_dir / f"evaluation{eval_suffix}"
-
-        self.download_file(eval_cfg.url, eval_path)
-        eval_cfg.path = str(eval_path)
-
-        print("==> evaluation dataset prepared")
-
-
-path: /app/bootstrap_loader.py
+path: /app/bootstrap/bootstrap_loader.py
 ----------------------------------------
 from __future__ import annotations
 
 import copy
 from typing import Any, Dict, Tuple
 
-from archiver import build_retry_session
-from schemas import JobConfig
+from ..pipeline.archiver import build_retry_session
+from ..bootstrap.schemas import JobConfig
 
 
 def _resolve_callback_url(payload: Dict[str, Any], key: str) -> str | None:
@@ -918,7 +541,7 @@ def load_remote_job_config(
     return cfg, meta
 
 
-path: /app/config_loader.py
+path: /app/bootstrap/config_loader.py
 ----------------------------------------
 import copy
 import json
@@ -927,7 +550,7 @@ from typing import Any, Dict
 
 import requests
 
-from schemas import JobConfig
+from ..bootstrap.schemas import JobConfig
 
 
 def _migrate_legacy_config(raw: Dict[str, Any], source_ref: str) -> Dict[str, Any]:
@@ -1009,7 +632,643 @@ def load_config(path: str) -> JobConfig:
     return JobConfig.model_validate(migrated)
 
 
-path: /app/eval_runner.py
+path: /app/bootstrap/schemas.py
+----------------------------------------
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Dict, List, Literal, Optional
+
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+DEFAULT_EVAL_PROMPT = """Ты — беспристрастный эксперт-оценщик. Тебе предоставлен вопрос и ответ кандидата.
+Твоя задача — выставить оценку от 0 до 5, где:
+5 — идеально правильный и полный ответ,
+0 — совершенно неверный или отсутствующий ответ.
+
+Теги вопроса: ${tagsText}
+Эти теги являются метаданными. Не завышай и не занижай оценку только из-за тегов.
+
+Вопрос: ${question}
+Ответ кандидата: ${candidateAnswer}
+
+Верни результат строго в формате JSON:
+{
+  "score": <число от 0 до 5>,
+  "feedback": "<краткое пояснение>"
+}
+
+Если не можешь вернуть JSON, обязательно напиши в конце: "score: X/5"
+"""
+
+
+class AppBaseModel(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+
+class ModelConfig(AppBaseModel):
+    source: Literal["local", "huggingface"] = "local"
+    local_path: Optional[str] = None
+    repo_id: Optional[str] = None
+    revision: str = "main"
+    trust_remote_code: bool = False
+    load_in_4bit: Optional[bool] = None
+    dtype: Literal["auto", "float16", "bfloat16", "float32"] = "auto"
+    max_seq_length: int = 4096
+
+    base_model: Optional[str] = None
+    base_model_name_or_path: Optional[str] = None
+
+    @staticmethod
+    def _is_probably_local_path(value: str) -> bool:
+        value = str(value or "").strip()
+        if not value:
+            return False
+        if value.startswith("/"):
+            return True
+        if value.startswith("./") or value.startswith("../"):
+            return True
+        if value.startswith("\\") or "\\" in value:
+            return True
+        if len(value) > 1 and value[1] == ":":
+            return True
+        return False
+
+    @property
+    def logical_base_model_id(self) -> Optional[str]:
+        for candidate in (
+            self.repo_id,
+            self.base_model_name_or_path,
+            self.base_model,
+        ):
+            if not isinstance(candidate, str):
+                continue
+            value = candidate.strip()
+            if not value:
+                continue
+            if self._is_probably_local_path(value):
+                continue
+            return value
+        return None
+
+    @model_validator(mode="after")
+    def validate_source(self) -> "ModelConfig":
+        if self.source == "local" and not self.local_path:
+            raise ValueError("model.local_path is required when model.source='local'")
+        if self.source == "huggingface" and not self.repo_id:
+            raise ValueError("model.repo_id is required when model.source='huggingface'")
+        return self
+
+
+class DatasetConfig(AppBaseModel):
+    source: Literal["local", "url"] = "local"
+    train_path: Optional[str] = None
+    val_path: Optional[str] = None
+    train_url: Optional[str] = None
+    val_url: Optional[str] = None
+    format: Literal["instruction_output", "messages", "prompt_completion"] = "instruction_output"
+    input_field: str = "input"
+    output_field: str = "output"
+    messages_field: str = "messages"
+
+    @model_validator(mode="after")
+    def validate_dataset(self) -> "DatasetConfig":
+        if self.source == "local" and not self.train_path:
+            raise ValueError("dataset.train_path is required when dataset.source='local'")
+        if self.source == "url" and not self.train_url:
+            raise ValueError("dataset.train_url is required when dataset.source='url'")
+        return self
+
+
+class TrainingConfig(AppBaseModel):
+    method: Literal["lora", "qlora"] = "qlora"
+    max_seq_length: int = 4096
+    per_device_train_batch_size: int = 1
+    gradient_accumulation_steps: int = 8
+    num_train_epochs: int = 1
+    learning_rate: float = 1e-4
+    warmup_ratio: float = 0.03
+    logging_steps: int = 1
+    save_steps: int = 50
+    eval_steps: int = 50
+    bf16: bool = True
+    packing: bool = True
+    save_total_limit: int = 2
+    optim: str = "adamw_8bit"
+    output_dir: Optional[str] = None
+
+
+class LoraConfig(AppBaseModel):
+    r: int = 16
+    lora_alpha: int = 32
+    lora_dropout: float = 0.0
+    bias: str = "none"
+    use_gradient_checkpointing: str = "unsloth"
+    random_state: int = 3407
+    target_modules: List[str] = Field(default_factory=list)
+
+
+class OutputsConfig(AppBaseModel):
+    base_dir: str
+    logs_dir: Optional[str] = None
+    lora_dir: Optional[str] = None
+    checkpoints_dir: Optional[str] = None
+    metrics_dir: Optional[str] = None
+    merged_dir: Optional[str] = None
+    quantized_dir: Optional[str] = None
+    eval_dir: Optional[str] = None
+    downloads_dir: Optional[str] = None
+
+    @model_validator(mode="after")
+    def fill_defaults(self) -> "OutputsConfig":
+        base = Path(self.base_dir)
+
+        if not self.logs_dir:
+            self.logs_dir = str(base / "logs")
+        if not self.lora_dir:
+            self.lora_dir = str(base / "lora")
+        if not self.checkpoints_dir:
+            self.checkpoints_dir = str(base / "checkpoints")
+        if not self.metrics_dir:
+            self.metrics_dir = str(base / "metrics")
+        if not self.merged_dir:
+            self.merged_dir = str(base / "merged")
+        if not self.quantized_dir:
+            self.quantized_dir = str(base / "quantized")
+        if not self.eval_dir:
+            self.eval_dir = str(base / "evaluation")
+        if not self.downloads_dir:
+            self.downloads_dir = str(base / "downloads")
+
+        return self
+
+
+class PostprocessConfig(AppBaseModel):
+    merge_lora: bool = True
+    save_merged_16bit: bool = True
+    run_awq_quantization: bool = False
+
+
+class AuthConfig(AppBaseModel):
+    bearer_token: Optional[str] = None
+    headers: Dict[str, str] = Field(default_factory=dict)
+
+
+class CallbackConfig(AppBaseModel):
+    enabled: bool = False
+    url: Optional[str] = None
+    timeout_sec: int = 15
+    auth: AuthConfig = Field(default_factory=AuthConfig)
+
+    @property
+    def active(self) -> bool:
+        return self.enabled and bool(self.url)
+
+
+class ReportingConfig(AppBaseModel):
+    status: CallbackConfig = Field(default_factory=CallbackConfig)
+    progress: CallbackConfig = Field(default_factory=CallbackConfig)
+    final: CallbackConfig = Field(default_factory=CallbackConfig)
+    logs: CallbackConfig = Field(default_factory=CallbackConfig)
+
+
+class EvaluationDatasetConfig(AppBaseModel):
+    source: Literal["local", "url"] = "local"
+    path: Optional[str] = None
+    url: Optional[str] = None
+    format: Literal["json", "jsonl"] = "jsonl"
+    question_field: str = "question"
+    answer_field: str = "candidate_answer"
+    score_field: str = "reference_score"
+    max_score_field: Optional[str] = "max_score"
+    tags_field: Optional[str] = "hash_tags"
+
+    @model_validator(mode="after")
+    def validate_source(self) -> "EvaluationDatasetConfig":
+        if self.source == "local" and not self.path:
+            raise ValueError("evaluation.dataset.path is required when source='local'")
+        if self.source == "url" and not self.url:
+            raise ValueError("evaluation.dataset.url is required when source='url'")
+        return self
+
+
+class EvaluationConfig(AppBaseModel):
+    enabled: bool = False
+    target: Literal["auto", "lora", "merged"] = "auto"
+    max_samples: Optional[int] = None
+    max_new_tokens: int = 128
+    temperature: float = 0.0
+    do_sample: bool = False
+    system_prompt: Optional[str] = None
+    prompt_template: str = DEFAULT_EVAL_PROMPT
+    parsing_regex: Optional[str] = None
+    score_min: float = 0.0
+    score_max: float = 5.0
+    dataset: Optional[EvaluationDatasetConfig] = None
+
+    @model_validator(mode="after")
+    def validate_enabled(self) -> "EvaluationConfig":
+        if self.enabled and self.dataset is None:
+            raise ValueError("evaluation.dataset is required when evaluation.enabled=true")
+        return self
+
+
+class UrlArtifactTargets(AppBaseModel):
+    logs_url: Optional[str] = None
+    effective_config_url: Optional[str] = None
+    summary_url: Optional[str] = None
+    train_metrics_url: Optional[str] = None
+    train_history_url: Optional[str] = None
+    eval_summary_url: Optional[str] = None
+    eval_details_url: Optional[str] = None
+    lora_archive_url: Optional[str] = None
+    merged_archive_url: Optional[str] = None
+    full_archive_url: Optional[str] = None
+
+
+class UploadConfig(AppBaseModel):
+    enabled: bool = False
+    target: Literal["local", "huggingface", "url"] = "local"
+    upload_url: Optional[str] = None
+    timeout_sec: int = 120
+    auth: AuthConfig = Field(default_factory=AuthConfig)
+    url_targets: UrlArtifactTargets = Field(default_factory=UrlArtifactTargets)
+
+    repo_id_lora: Optional[str] = None
+    repo_id_merged: Optional[str] = None
+    repo_id_metadata: Optional[str] = None
+    private: bool = True
+    commit_message: str = "trainer-service upload"
+
+
+class HuggingFacePublishConfig(AppBaseModel):
+    enabled: bool = False
+    push_lora: bool = False
+    push_merged: bool = False
+    repo_id_lora: Optional[str] = None
+    repo_id_merged: Optional[str] = None
+    repo_id_metadata: Optional[str] = None
+    private: bool = True
+    commit_message: str = "trainer-service upload"
+    revision: Optional[str] = None
+
+
+class PipelineStage(AppBaseModel):
+    enabled: bool = True
+
+
+class TrainingStage(PipelineStage, TrainingConfig):
+    pass
+
+
+class MergeStage(PipelineStage, PostprocessConfig):
+    pass
+
+
+class EvaluationStage(PipelineStage, EvaluationConfig):
+    pass
+
+
+class PublishStage(PipelineStage, HuggingFacePublishConfig):
+    pass
+
+
+class UploadStage(PipelineStage, UploadConfig):
+    pass
+
+
+class PipelineStep(AppBaseModel):
+    key: str
+    displayName: str
+    kind: str
+    enabled: bool = True
+    dependsOn: List[str] = Field(default_factory=list)
+    weight: Optional[float] = None
+
+
+class PipelineConfig(AppBaseModel):
+    prepare_assets: PipelineStage = Field(default_factory=PipelineStage)
+    training: TrainingStage = Field(default_factory=TrainingStage)
+    merge: MergeStage = Field(default_factory=MergeStage)
+    evaluation: EvaluationStage = Field(default_factory=EvaluationStage)
+    publish: PublishStage = Field(default_factory=PublishStage)
+    upload: UploadStage = Field(default_factory=UploadStage)
+    steps: List[PipelineStep] = Field(default_factory=list)
+
+
+class JobConfig(AppBaseModel):
+    job_id: Optional[str] = None
+    job_name: str
+    mode: Literal["local", "remote", "auto"] = "auto"
+
+    model: ModelConfig
+    dataset: DatasetConfig
+    training: TrainingConfig
+    lora: LoraConfig
+    outputs: OutputsConfig
+
+    postprocess: PostprocessConfig = Field(default_factory=PostprocessConfig)
+    evaluation: EvaluationConfig = Field(default_factory=EvaluationConfig)
+    upload: UploadConfig = Field(default_factory=UploadConfig)
+    huggingface: HuggingFacePublishConfig = Field(default_factory=HuggingFacePublishConfig)
+    reporting: ReportingConfig = Field(default_factory=ReportingConfig)
+
+    pipeline: Optional[PipelineConfig] = None
+
+    report_url: Optional[str] = None
+
+
+path: /app/pipeline/__init__.py
+----------------------------------------
+
+
+
+path: /app/pipeline/archiver.py
+----------------------------------------
+from __future__ import annotations
+
+import logging
+import tarfile
+from pathlib import Path
+from typing import Dict, Iterable, Optional
+
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+logger = logging.getLogger(__name__)
+
+_ALREADY_COMPRESSED_SUFFIXES = {
+    ".safetensors",
+    ".bin",
+    ".pt",
+    ".pth",
+    ".ckpt",
+    ".gguf",
+    ".zip",
+    ".gz",
+    ".bz2",
+    ".xz",
+}
+
+_LARGE_FILE_THRESHOLD = 512 * 1024 * 1024
+_LARGE_TOTAL_THRESHOLD = 2 * 1024 * 1024 * 1024
+
+
+def build_retry_session(total_retries: int = 3) -> requests.Session:
+    retry = Retry(
+        total=total_retries,
+        connect=total_retries,
+        read=total_retries,
+        status=total_retries,
+        other=total_retries,
+        backoff_factor=1.0,
+        allowed_methods=None,
+        status_forcelist=[408, 425, 429, 500, 502, 503, 504],
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    session = requests.Session()
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    return session
+
+
+class Archiver:
+    def __init__(self, session: Optional[requests.Session] = None, retries: int = 3):
+        self.session = session or build_retry_session(retries)
+
+    def _iter_roots(self, source_path: Path, excluded: set[str]):
+        for item in sorted(source_path.iterdir(), key=lambda p: p.name):
+            if item.name in excluded:
+                continue
+            if item.is_file() and item.name.endswith((".tar", ".tar.gz", ".tgz")):
+                continue
+            yield item
+
+    def _collect_stats(self, source_path: Path, excluded: set[str]) -> Dict[str, int | bool]:
+        file_count = 0
+        total_bytes = 0
+        has_large_file = False
+        has_already_compressed = False
+
+        for root in self._iter_roots(source_path, excluded):
+            if root.is_file():
+                candidates = [root]
+            else:
+                candidates = [p for p in root.rglob("*") if p.is_file()]
+
+            for file_path in candidates:
+                try:
+                    stat = file_path.stat()
+                except OSError:
+                    continue
+
+                file_count += 1
+                total_bytes += stat.st_size
+
+                if stat.st_size >= _LARGE_FILE_THRESHOLD:
+                    has_large_file = True
+
+                if file_path.suffix.lower() in _ALREADY_COMPRESSED_SUFFIXES:
+                    has_already_compressed = True
+
+        return {
+            "file_count": file_count,
+            "total_bytes": total_bytes,
+            "has_large_file": has_large_file,
+            "has_already_compressed": has_already_compressed,
+        }
+
+    def _should_compress(
+        self,
+        source_path: Path,
+        excluded: set[str],
+        compress: Optional[bool],
+    ) -> bool:
+        if compress is not None:
+            return bool(compress)
+
+        stats = self._collect_stats(source_path, excluded)
+
+        if stats["has_already_compressed"]:
+            return False
+        if stats["has_large_file"]:
+            return False
+        if int(stats["total_bytes"]) >= _LARGE_TOTAL_THRESHOLD:
+            return False
+
+        return True
+
+    @staticmethod
+    def _normalize_output_path(output_path: Path, compress: bool) -> Path:
+        name = output_path.name
+
+        if compress:
+            if name.endswith(".tar.gz") or name.endswith(".tgz"):
+                return output_path
+            if name.endswith(".tar"):
+                return output_path.with_name(f"{name}.gz")
+            return output_path.with_name(f"{name}.tar.gz")
+
+        if name.endswith(".tar.gz"):
+            return output_path.with_name(name[:-3])
+        if name.endswith(".tgz"):
+            return output_path.with_name(f"{name[:-4]}.tar")
+        if name.endswith(".tar"):
+            return output_path
+        return output_path.with_name(f"{name}.tar")
+
+    def make_archive(
+        self,
+        source_dir: str,
+        output_filename: str,
+        exclude_names: Optional[Iterable[str]] = None,
+        compress: Optional[bool] = None,
+    ) -> str:
+        source_path = Path(source_dir).resolve()
+        excluded = set(exclude_names or set())
+        excluded.update({"downloads", "__pycache__"})
+
+        requested_output_path = Path(output_filename).resolve()
+
+        if requested_output_path.parent == source_path:
+            excluded.add(requested_output_path.name)
+
+        use_compression = self._should_compress(source_path, excluded, compress)
+        output_path = self._normalize_output_path(requested_output_path, use_compression)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        stats = self._collect_stats(source_path, excluded)
+        mode = "w:gz" if use_compression else "w"
+
+        logger.info(
+            "==> creating archive %s from %s (mode=%s, files=%s, size_bytes=%s)",
+            output_path,
+            source_path,
+            mode,
+            stats["file_count"],
+            stats["total_bytes"],
+        )
+        print(f"==> creating archive {output_path} from {source_path}")
+
+        open_kwargs = {"compresslevel": 1} if use_compression else {}
+        with tarfile.open(output_path, mode, **open_kwargs) as tar:
+            for item in self._iter_roots(source_path, excluded):
+                tar.add(item, arcname=item.name)
+
+        logger.info("==> archive ready: %s", output_path)
+        return str(output_path)
+
+    def upload_archive(
+        self,
+        archive_path: str,
+        upload_url: str,
+        headers: Optional[Dict[str, str]] = None,
+        form_data: Optional[Dict[str, str]] = None,
+        timeout_sec: int = 120,
+    ) -> None:
+        archive = Path(archive_path)
+        logger.info("==> uploading archive to %s: %s", upload_url, archive)
+        print(f"==> uploading archive to {upload_url}")
+
+        content_type = "application/gzip" if archive.name.endswith(".gz") else "application/x-tar"
+
+        with open(archive_path, "rb") as f:
+            files = {"file": (archive.name, f, content_type)}
+            response = self.session.post(
+                upload_url,
+                files=files,
+                data=form_data or {},
+                headers=headers or {},
+                timeout=(10, timeout_sec),
+            )
+            response.raise_for_status()
+
+        logger.info("==> upload successful: %s", archive)
+        print("==> upload successful")
+
+
+path: /app/pipeline/asset_manager.py
+----------------------------------------
+from __future__ import annotations
+
+from pathlib import Path
+from urllib.parse import urlparse
+
+import requests
+
+from ..bootstrap.schemas import JobConfig
+
+
+class AssetManager:
+    def __init__(self, cfg: JobConfig):
+        self.cfg = cfg
+        self.download_dir = Path(cfg.outputs.downloads_dir)
+
+    def _infer_suffix(self, url: str, default_suffix: str = ".json") -> str:
+        parsed = urlparse(url)
+        suffix = Path(parsed.path).suffix
+        return suffix or default_suffix
+
+    def download_file(self, url: str, dest_path: Path) -> Path:
+        print(f"==> downloading {url} to {dest_path}")
+        dest_path.parent.mkdir(parents=True, exist_ok=True)
+
+        with requests.get(url, stream=True, timeout=120) as response:
+            response.raise_for_status()
+            with dest_path.open("wb") as f:
+                for chunk in response.iter_content(chunk_size=1024 * 1024):
+                    if chunk:
+                        f.write(chunk)
+
+        return dest_path
+
+    def prepare_dataset(self, cfg: JobConfig) -> None:
+        if cfg.dataset.source != "url":
+            return
+
+        dataset_dir = self.download_dir / "dataset"
+        dataset_dir.mkdir(parents=True, exist_ok=True)
+
+        if cfg.dataset.train_url:
+            train_suffix = self._infer_suffix(cfg.dataset.train_url, ".json")
+            train_path = dataset_dir / f"train{train_suffix}"
+            self.download_file(cfg.dataset.train_url, train_path)
+            cfg.dataset.train_path = str(train_path)
+
+        if cfg.dataset.val_url:
+            val_suffix = self._infer_suffix(cfg.dataset.val_url, ".json")
+            val_path = dataset_dir / f"val{val_suffix}"
+            self.download_file(cfg.dataset.val_url, val_path)
+            cfg.dataset.val_path = str(val_path)
+
+        print("==> dataset prepared")
+
+    def prepare_evaluation_dataset(self, cfg: JobConfig) -> None:
+        if not cfg.evaluation.enabled or not cfg.evaluation.dataset:
+            return
+
+        eval_cfg = cfg.evaluation.dataset
+        if eval_cfg.source != "url" or not eval_cfg.url:
+            return
+
+        eval_dir = self.download_dir / "evaluation"
+        eval_dir.mkdir(parents=True, exist_ok=True)
+
+        eval_suffix = self._infer_suffix(
+            eval_cfg.url,
+            ".jsonl" if eval_cfg.format == "jsonl" else ".json",
+        )
+        eval_path = eval_dir / f"evaluation{eval_suffix}"
+
+        self.download_file(eval_cfg.url, eval_path)
+        eval_cfg.path = str(eval_path)
+
+        print("==> evaluation dataset prepared")
+
+
+path: /app/pipeline/eval_runner.py
 ----------------------------------------
 from __future__ import annotations
 
@@ -1025,8 +1284,8 @@ import torch
 from peft import PeftModel
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from reporter import Reporter
-from schemas import JobConfig
+from ..adapters.reporter import Reporter
+from ..bootstrap.schemas import JobConfig
 
 logger = logging.getLogger(__name__)
 
@@ -1562,268 +1821,1127 @@ def run_evaluation(
     }
 
 
-path: /app/hf_utils.py
+path: /app/pipeline/publish_runner.py
 ----------------------------------------
-from __future__ import annotations
-
-import os
-from typing import Optional
+import logging
+import re
+from pathlib import Path
+from typing import Any, Dict, Optional
 
 from huggingface_hub import HfApi
 
+from ..adapters.hf_utils import build_hf_api, get_hf_token
+from ..bootstrap.schemas import JobConfig
 
-def get_hf_token() -> Optional[str]:
-    return (
-        os.environ.get("HF_TOKEN")
-        or os.environ.get("HUGGINGFACE_HUB_TOKEN")
-        or os.environ.get("HUGGINGFACE_TOKEN")
-    )
+logger = logging.getLogger(__name__)
 
+class PublishRunner:
+    def __init__(self, cfg: JobConfig):
+        self.cfg = cfg
 
-def build_hf_api() -> HfApi:
-    token = get_hf_token()
-    if not token:
-        raise RuntimeError("HF upload requested but HF_TOKEN is not set")
-    return HfApi(token=token)
-
-
-def validate_hf_token() -> dict:
-    api = build_hf_api()
-    return api.whoami()
-
-
-def try_hf_login() -> bool:
-    token = get_hf_token()
-    if not token:
-        print("==> HF_TOKEN not set, skip HF auth check")
+    def _is_probably_local_model_ref(self, value: str) -> bool:
+        value = str(value or "").strip()
+        if not value:
+            return False
+        if value.startswith("/"):
+            return True
+        if value.startswith("./") or value.startswith("../"):
+            return True
+        if value.startswith("\\") or "\\" in value:
+            return True
+        if len(value) > 1 and value[1] == ":":
+            return True
         return False
 
-    info = HfApi(token=token).whoami()
-    name = info.get("name") or info.get("fullname") or "unknown"
-    print(f"==> Hugging Face auth success: {name}")
-    return True
-
-
-path: /app/log_streamer.py
-----------------------------------------
-from __future__ import annotations
-
-import logging
-import sys
-import threading
-from typing import Dict, Optional
-
-from archiver import build_retry_session
-
-
-class LogStreamer(logging.Handler):
-    def __init__(
+    def _resolve_hf_base_model_id(
         self,
-        logs_url: str,
-        job_id: str,
-        job_name: str,
-        bearer_token: Optional[str] = None,
-        timeout_sec: int = 10,
-    ):
-        super().__init__()
-        self.logs_url = str(logs_url or "").strip()
-        self.job_id = job_id
-        self.job_name = job_name
-        self.timeout_sec = timeout_sec
-        self.session = build_retry_session(total_retries=2)
-        self.lock = threading.Lock()
-        self.offset = 0
+        training_result: Optional[Dict[str, Any]] = None,
+    ) -> Optional[str]:
+        candidates = []
 
-        self.headers: Dict[str, str] = {"Content-Type": "application/json"}
-        if bearer_token:
-            self.headers["Authorization"] = f"Bearer {bearer_token}"
-
-    def emit(self, record: logging.LogRecord) -> None:
-        try:
-            message = self.format(record)
-            if not message:
-                return
-
-            chunk = f"{message}\n"
-            encoded = chunk.encode("utf-8", errors="replace")
-
-            with self.lock:
-                current_offset = self.offset
-                self.offset += len(encoded)
-
-            payload = {
-                "job_id": self.job_id,
-                "job_name": self.job_name,
-                "offset": current_offset,
-                "chunk": chunk,
-            }
-
-            response = self.session.post(
-                self.logs_url,
-                json=payload,
-                headers=self.headers,
-                timeout=(5, self.timeout_sec),
+        if training_result:
+            candidates.extend(
+                [
+                    training_result.get("base_model_id"),
+                    training_result.get("base_model_name_or_path"),
+                    training_result.get("base_model"),
+                ]
             )
-            response.raise_for_status()
-        except Exception as exc:
-            try:
-                sys.stderr.write(f"[log-streamer] failed to send log chunk: {exc}\n")
-                sys.stderr.flush()
-            except Exception:
-                pass
+            summary = training_result.get("summary") or {}
+            if isinstance(summary, dict):
+                candidates.extend(
+                    [
+                        summary.get("base_model_id"),
+                        summary.get("base_model_name_or_path"),
+                        summary.get("base_model"),
+                    ]
+                )
 
-    def close(self) -> None:
-        try:
-            self.session.close()
-        except Exception:
-            pass
-        super().close()
+        candidates.extend(
+            [
+                self.cfg.model.logical_base_model_id,
+                self.cfg.model.repo_id,
+                self.cfg.model.base_model_name_or_path,
+                self.cfg.model.base_model,
+            ]
+        )
+
+        for candidate in candidates:
+            if not isinstance(candidate, str):
+                continue
+            value = candidate.strip()
+            if not value:
+                continue
+            if self._is_probably_local_model_ref(value):
+                continue
+            return value
+
+        return None
+
+    def _rewrite_readme_frontmatter_base_model(
+        self,
+        readme_path: Path,
+        base_model_id: Optional[str],
+    ) -> bool:
+        if not readme_path.exists():
+            return False
+
+        original = readme_path.read_text(encoding="utf-8")
+        newline = "\r\n" if "\r\n" in original else "\n"
+        had_trailing_newline = original.endswith("\n") or original.endswith("\r")
+
+        def finalize(parts: list[str]) -> str:
+            text = newline.join(parts)
+            if had_trailing_newline and not text.endswith(newline):
+                text += newline
+            return text
+
+        lines = original.splitlines()
+
+        if lines and lines[0].strip() == "---":
+            frontmatter_end = None
+            for idx in range(1, len(lines)):
+                if lines[idx].strip() == "---":
+                    frontmatter_end = idx
+                    break
+
+            if frontmatter_end is not None:
+                header_lines = lines[1:frontmatter_end]
+                body_lines = lines[frontmatter_end + 1 :]
+
+                updated_header: list[str] = []
+                found_base_model = False
+                changed = False
+
+                for line in header_lines:
+                    if re.match(r"^\s*base_model\s*:", line):
+                        found_base_model = True
+                        if base_model_id:
+                            replacement = f"base_model: {base_model_id}"
+                            updated_header.append(replacement)
+                            if line != replacement:
+                                changed = True
+                        else:
+                            changed = True
+                        continue
+                    updated_header.append(line)
+
+                if base_model_id and not found_base_model:
+                    updated_header.append(f"base_model: {base_model_id}")
+                    changed = True
+
+                if not changed:
+                    return False
+
+                updated = finalize(["---", *updated_header, "---", *body_lines])
+                readme_path.write_text(updated, encoding="utf-8")
+                return True
+
+        if not base_model_id:
+            return False
+
+        updated = f"---{newline}base_model: {base_model_id}{newline}---{newline}{newline}{original}"
+        readme_path.write_text(updated, encoding="utf-8")
+        return True
+
+    def _normalize_model_card_metadata(
+        self,
+        folder_path: str,
+        training_result: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        repo_dir = Path(folder_path)
+        readme_path = repo_dir / "README.md"
+        if not readme_path.exists():
+            return
+
+        base_model_id = self._resolve_hf_base_model_id(training_result)
+        changed = self._rewrite_readme_frontmatter_base_model(readme_path, base_model_id)
+        if changed:
+            logger.info(
+                "==> normalized README.md metadata in %s (base_model=%s)",
+                readme_path,
+                base_model_id or "<removed>",
+            )
+
+    def _hf_plan(self) -> Dict[str, Any]:
+        lora_repo = self.cfg.huggingface.repo_id_lora or self.cfg.upload.repo_id_lora
+        merged_repo = self.cfg.huggingface.repo_id_merged or self.cfg.upload.repo_id_merged
+        metadata_repo = (
+            self.cfg.huggingface.repo_id_metadata
+            or self.cfg.upload.repo_id_metadata
+            or lora_repo
+            or merged_repo
+        )
+
+        request_lora = bool(
+            lora_repo and (
+                self.cfg.huggingface.push_lora
+                or self.cfg.upload.target == "huggingface"
+            )
+        )
+        request_merged = bool(
+            merged_repo and (
+                self.cfg.huggingface.push_merged
+                or self.cfg.upload.target == "huggingface"
+            )
+        )
+        request_metadata = bool(
+            metadata_repo and (
+                self.cfg.huggingface.enabled
+                or self.cfg.upload.target == "huggingface"
+                or request_lora
+                or request_merged
+            )
+        )
+
+        private = (
+            self.cfg.huggingface.private
+            if self.cfg.huggingface.enabled
+            else self.cfg.upload.private
+        )
+        commit_message = (
+            self.cfg.huggingface.commit_message
+            if self.cfg.huggingface.enabled
+            else self.cfg.upload.commit_message
+        )
+        revision = self.cfg.huggingface.revision
+
+        return {
+            "request_lora": request_lora,
+            "request_merged": request_merged,
+            "request_metadata": request_metadata,
+            "lora_repo": lora_repo,
+            "merged_repo": merged_repo,
+            "metadata_repo": metadata_repo,
+            "private": private,
+            "commit_message": commit_message,
+            "revision": revision,
+        }
+
+    def ensure_hf_ready(self) -> Dict[str, Any]:
+        plan = self._hf_plan()
+
+        if not plan["request_lora"] and not plan["request_merged"] and not plan["request_metadata"]:
+            return plan
+
+        if not get_hf_token():
+            raise RuntimeError("Hugging Face upload is requested, but HF_TOKEN is missing")
+
+        if plan["request_lora"] and not plan["lora_repo"]:
+            raise RuntimeError("LoRA upload is requested, but repo_id_lora is missing")
+
+        if plan["request_merged"] and not plan["merged_repo"]:
+            raise RuntimeError("Merged upload is requested, but repo_id_merged is missing")
+
+        if plan["request_metadata"] and not plan["metadata_repo"]:
+            raise RuntimeError("Metadata upload is requested, but metadata repo cannot be resolved")
+
+        api = build_hf_api()
+        whoami = api.whoami()
+        logger.info("==> Hugging Face upload ready for account: %s", whoami.get("name") or "unknown")
+        return plan
+
+    def upload_to_huggingface(self, training_result: Dict) -> Dict[str, Dict[str, str]]:
+        uploaded: Dict[str, Dict[str, str]] = {}
+        plan = self._hf_plan()
+
+        if not plan["request_lora"] and not plan["request_merged"]:
+            return uploaded
+
+        api = build_hf_api()
+
+        if plan["request_lora"]:
+            lora_dir = training_result.get("lora_dir")
+            if not lora_dir or not Path(lora_dir).exists():
+                raise RuntimeError("LoRA upload requested but lora_dir is missing")
+
+            self._normalize_model_card_metadata(lora_dir, training_result)
+
+            api.create_repo(
+                repo_id=plan["lora_repo"],
+                repo_type="model",
+                private=plan["private"],
+                exist_ok=True,
+            )
+            api.upload_folder(
+                repo_id=plan["lora_repo"],
+                repo_type="model",
+                folder_path=lora_dir,
+                commit_message=plan["commit_message"],
+                revision=plan["revision"],
+                ignore_patterns=["__pycache__/**", "*.tmp", "*.log"],
+            )
+            uploaded["hf_lora"] = {"repo_id": plan["lora_repo"], "path": lora_dir}
+
+        if plan["request_merged"]:
+            merged_dir = training_result.get("merged_dir")
+            if not merged_dir or not Path(merged_dir).exists():
+                raise RuntimeError("Merged upload requested but merged_dir is missing")
+
+            self._normalize_model_card_metadata(merged_dir, training_result)
+
+            api.create_repo(
+                repo_id=plan["merged_repo"],
+                repo_type="model",
+                private=plan["private"],
+                exist_ok=True,
+            )
+            api.upload_folder(
+                repo_id=plan["merged_repo"],
+                repo_type="model",
+                folder_path=merged_dir,
+                commit_message=plan["commit_message"],
+                revision=plan["revision"],
+                ignore_patterns=["__pycache__/**", "*.tmp", "*.log"],
+            )
+            uploaded["hf_merged"] = {"repo_id": plan["merged_repo"], "path": merged_dir}
+
+        return uploaded
+
+    def _upload_file_to_hf(
+        self,
+        api: HfApi,
+        repo_id: str,
+        file_path: str,
+        path_in_repo: str,
+        commit_message: str,
+        revision: Optional[str] = None,
+    ) -> Optional[str]:
+        path = Path(file_path)
+        if not path.exists():
+            return None
+
+        api.upload_file(
+            path_or_fileobj=str(path),
+            path_in_repo=path_in_repo,
+            repo_id=repo_id,
+            repo_type="model",
+            commit_message=commit_message,
+            revision=revision,
+        )
+        return path_in_repo
+
+    def upload_hf_metadata(
+        self,
+        log_file: str,
+        effective_config_path: str,
+        result_path: str,
+        training_result: Dict,
+        eval_result: Optional[Dict] = None,
+    ) -> Dict[str, Dict[str, Any]]:
+        uploaded: Dict[str, Dict[str, Any]] = {}
+        plan = self._hf_plan()
+
+        if not plan["request_metadata"]:
+            return uploaded
+
+        repo_id = plan["metadata_repo"]
+        if not repo_id:
+            return uploaded
+
+        api = build_hf_api()
+        api.create_repo(
+            repo_id=repo_id,
+            repo_type="model",
+            private=plan["private"],
+            exist_ok=True,
+        )
+
+        commit_message = f"{plan['commit_message']} (metadata)"
+        revision = plan["revision"]
+
+        uploaded_files: list[str] = []
+
+        file_specs = [
+            (log_file, "artifacts/logs/trainer.log"),
+            (effective_config_path, "artifacts/config/effective-job.json"),
+            (result_path, "artifacts/result/job-result.json"),
+        ]
+
+        if training_result.get("metrics_path"):
+            file_specs.append(
+                (training_result["metrics_path"], "artifacts/train/train_metrics.json")
+            )
+        if training_result.get("history_path"):
+            file_specs.append(
+                (training_result["history_path"], "artifacts/train/train_history.json")
+            )
+        if training_result.get("train_summary_path"):
+            file_specs.append(
+                (training_result["train_summary_path"], "artifacts/train/train_summary.json")
+            )
+
+        if eval_result:
+            if eval_result.get("summary_json_path"):
+                file_specs.append(
+                    (eval_result["summary_json_path"], "artifacts/evaluation/summary.json")
+                )
+            if eval_result.get("result_json_path"):
+                file_specs.append(
+                    (eval_result["result_json_path"], "artifacts/evaluation/result.json")
+                )
+            if eval_result.get("summary_csv_path"):
+                file_specs.append(
+                    (eval_result["summary_csv_path"], "artifacts/evaluation/summary.csv")
+                )
+            if eval_result.get("detailed_csv_path"):
+                file_specs.append(
+                    (eval_result["detailed_csv_path"], "artifacts/evaluation/detailed.csv")
+                )
+
+        for local_path, path_in_repo in file_specs:
+            uploaded_path = self._upload_file_to_hf(
+                api=api,
+                repo_id=repo_id,
+                file_path=local_path,
+                path_in_repo=path_in_repo,
+                commit_message=commit_message,
+                revision=revision,
+            )
+            if uploaded_path:
+                uploaded_files.append(uploaded_path)
+
+        uploaded["hf_metadata"] = {
+            "repo_id": repo_id,
+            "files": uploaded_files,
+        }
+        return uploaded
 
 
-path: /app/quant_awq.py
-----------------------------------------
-
-
-
-path: /app/reporter.py
+path: /app/pipeline/train_runner.py
 ----------------------------------------
 from __future__ import annotations
 
+import inspect
+import json
 import logging
-import time
-from typing import Any, Dict, List
+import math
+import os
+from pathlib import Path
+from typing import Any, Dict, Optional
 
-from archiver import build_retry_session
-from schemas import CallbackConfig, JobConfig
+import unsloth  # noqa: F401
+from unsloth import FastLanguageModel
+
+import torch
+import os
+from datasets import load_dataset
+from transformers import TrainerCallback, TrainingArguments
+from trl import SFTTrainer
+
+from ..adapters.reporter import Reporter
+from ..bootstrap.schemas import JobConfig
 
 logger = logging.getLogger(__name__)
 
 
-class Reporter:
-    def __init__(self, cfg: JobConfig):
-        self.cfg = cfg
-        self.job_name = cfg.job_name
-        self.job_id = cfg.job_id or cfg.job_name
-        self.session = build_retry_session(total_retries=2)
+def ensure_dirs(cfg: JobConfig) -> None:
+    for path in [
+        cfg.outputs.base_dir,
+        cfg.outputs.logs_dir,
+        cfg.outputs.lora_dir,
+        cfg.outputs.checkpoints_dir,
+        cfg.outputs.metrics_dir,
+        cfg.outputs.merged_dir,
+        cfg.outputs.quantized_dir,
+        cfg.outputs.eval_dir,
+        cfg.outputs.downloads_dir,
+    ]:
+        Path(path).mkdir(parents=True, exist_ok=True)
 
-    def _build_headers(self, callback: CallbackConfig) -> Dict[str, str]:
-        headers: Dict[str, str] = {"Content-Type": "application/json"}
-        if callback.auth.headers:
-            headers.update(callback.auth.headers)
-        if callback.auth.bearer_token:
-            headers["Authorization"] = f"Bearer {callback.auth.bearer_token}"
-        return headers
 
-    def _callbacks_for(self, event_kind: str) -> List[CallbackConfig]:
-        callbacks: List[CallbackConfig] = []
+def resolve_model_args(cfg: JobConfig) -> tuple[str, bool, Optional[str]]:
+    if cfg.model.source == "local":
+        model_name = cfg.model.local_path
+    else:
+        model_name = cfg.model.repo_id
 
-        if event_kind == "status" and self.cfg.reporting.status.active:
-            callbacks.append(self.cfg.reporting.status)
-        elif event_kind == "progress" and self.cfg.reporting.progress.active:
-            callbacks.append(self.cfg.reporting.progress)
-        elif event_kind == "final" and self.cfg.reporting.final.active:
-            callbacks.append(self.cfg.reporting.final)
+    if not model_name:
+        raise ValueError("Model path/repo_id is empty")
 
-        if not callbacks and self.cfg.report_url:
-            callbacks.append(
-                CallbackConfig(
-                    enabled=True,
-                    url=self.cfg.report_url,
-                    timeout_sec=15,
-                )
-            )
+    load_in_4bit = (
+        bool(cfg.model.load_in_4bit)
+        if cfg.model.load_in_4bit is not None
+        else (cfg.training.method == "qlora")
+    )
 
-        return callbacks
+    logical_base_model_id = cfg.model.logical_base_model_id
+    return model_name, load_in_4bit, logical_base_model_id
 
-    def _emit(self, event_kind: str, payload: Dict[str, Any]) -> None:
-        callbacks = self._callbacks_for(event_kind)
-        if not callbacks:
+
+def safe_float(value: Any) -> Optional[float]:
+    try:
+        parsed = float(value)
+        if math.isfinite(parsed):
+            return parsed
+    except Exception:
+        pass
+    return None
+
+
+def build_text_from_messages(messages: list[dict], tokenizer) -> str:
+    try:
+        return tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=False,
+        )
+    except Exception:
+        parts = []
+        for msg in messages:
+            role = msg.get("role", "user")
+            content = msg.get("content", "")
+            parts.append(f"{role.upper()}: {content}")
+        return "\n".join(parts)
+
+
+def format_example(example: Dict[str, Any], cfg: JobConfig, tokenizer) -> Dict[str, str]:
+    eos_token = tokenizer.eos_token or ""
+
+    if cfg.dataset.format == "instruction_output":
+        input_value = str(example.get(cfg.dataset.input_field, "") or "").strip()
+        output_value = str(example.get(cfg.dataset.output_field, "") or "").strip()
+        text = (
+            f"### Instruction:\n{input_value}\n\n"
+            f"### Response:\n{output_value}{eos_token}"
+        )
+        return {"text": text}
+
+    if cfg.dataset.format == "prompt_completion":
+        prompt_value = str(example.get(cfg.dataset.input_field, "") or "").strip()
+        completion_value = str(example.get(cfg.dataset.output_field, "") or "").strip()
+        text = f"{prompt_value}{completion_value}{eos_token}"
+        return {"text": text}
+
+    if cfg.dataset.format == "messages":
+        messages = example.get(cfg.dataset.messages_field) or example.get("messages") or []
+        if not isinstance(messages, list):
+            return {"text": ""}
+        text = build_text_from_messages(messages, tokenizer)
+        if eos_token and not text.endswith(eos_token):
+            text = f"{text}{eos_token}"
+        return {"text": text}
+
+    raise ValueError(f"Unsupported dataset format: {cfg.dataset.format}")
+
+
+class TrainingProgressCallback(TrainerCallback):
+    def __init__(self, reporter: Optional[Reporter]):
+        self.reporter = reporter
+
+    def on_train_begin(self, args, state, control, **kwargs):
+        if not self.reporter:
+            return
+        self.reporter.report_status(
+            "running",
+            stage="training",
+            progress=0,
+            message="training started",
+            extra={"max_steps": int(state.max_steps or 0)},
+        )
+
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if not self.reporter or not logs:
             return
 
+        max_steps = int(state.max_steps or 0)
+        progress = round((int(state.global_step) / max_steps) * 100, 2) if max_steps > 0 else None
+
         payload = {
-            "job_id": self.job_id,
-            "job_name": self.job_name,
-            "event": event_kind,
-            "timestamp": time.time(),
-            **payload,
+            "step": int(state.global_step),
+            "epoch": safe_float(state.epoch),
+            **logs,
         }
 
-        for callback in callbacks:
-            try:
-                logger.info("==> reporting %s to %s", event_kind, callback.url)
-                response = self.session.post(
-                    callback.url,
-                    json=payload,
-                    headers=self._build_headers(callback),
-                    timeout=(5, callback.timeout_sec),
-                )
-                response.raise_for_status()
-            except Exception as exc:
-                logger.warning("failed to report %s: %s", event_kind, exc)
-
-    def report_status(
-        self,
-        status: str,
-        message: str | None = None,
-        stage: str | None = None,
-        progress: float | None = None,
-        extra: Dict[str, Any] | None = None,
-        logs: str | None = None,
-    ) -> None:
-        self._emit(
-            "status",
-            {
-                "status": status,
-                "stage": stage,
-                "progress": progress,
-                "message": message,
-                "logs": logs,
-                "extra": extra or {},
-            },
+        self.reporter.report_progress(
+            stage="training",
+            progress=progress,
+            message="trainer log",
+            extra=payload,
         )
 
-    def report_progress(
-        self,
-        stage: str,
-        progress: float | None = None,
-        message: str | None = None,
-        extra: Dict[str, Any] | None = None,
-    ) -> None:
-        self._emit(
-            "progress",
-            {
-                "status": "running",
-                "stage": stage,
-                "progress": progress,
-                "message": message,
-                "extra": extra or {},
-            },
+    def on_save(self, args, state, control, **kwargs):
+        if not self.reporter:
+            return
+
+        max_steps = int(state.max_steps or 0)
+        progress = round((int(state.global_step) / max_steps) * 100, 2) if max_steps > 0 else None
+
+        self.reporter.report_progress(
+            stage="training",
+            progress=progress,
+            message="checkpoint saved",
+            extra={"step": int(state.global_step)},
         )
 
-    def report_final(self, result: Dict[str, Any], status: str = "finished") -> None:
-        self._emit(
-            "final",
-            {
-                "status": status,
-                "result": result,
-            },
-        )
-
-    def report_error(
-        self,
-        error_message: str,
-        logs: str | None = None,
-        stage: str = "failed",
-        extra: Dict[str, Any] | None = None,
-    ) -> None:
-        self.report_status(
-            "failed",
-            message=error_message,
-            stage=stage,
+    def on_train_end(self, args, state, control, **kwargs):
+        if not self.reporter:
+            return
+        self.reporter.report_status(
+            "running",
+            stage="training",
             progress=100,
-            extra=extra or {},
-            logs=logs,
+            message="training finished",
+            extra={"step": int(state.global_step)},
         )
+
+
+def _build_training_args(cfg: JobConfig, checkpoint_dir: str, has_validation: bool) -> TrainingArguments:
+    common_kwargs = {
+        "output_dir": checkpoint_dir,
+        "per_device_train_batch_size": cfg.training.per_device_train_batch_size,
+        "gradient_accumulation_steps": cfg.training.gradient_accumulation_steps,
+        "warmup_ratio": cfg.training.warmup_ratio,
+        "num_train_epochs": cfg.training.num_train_epochs,
+        "learning_rate": cfg.training.learning_rate,
+        "bf16": cfg.training.bf16,
+        "fp16": not cfg.training.bf16,
+        "logging_steps": cfg.training.logging_steps,
+        "save_steps": cfg.training.save_steps,
+        "save_strategy": "steps",
+        "save_total_limit": cfg.training.save_total_limit,
+        "optim": cfg.training.optim,
+        "push_to_hub": False,
+        "logging_dir": cfg.outputs.logs_dir,
+    }
+
+    sig = inspect.signature(TrainingArguments.__init__)
+    supported = set(sig.parameters.keys())
+
+    filtered_kwargs = {k: v for k, v in common_kwargs.items() if k in supported}
+
+    if "report_to" in supported:
+        filtered_kwargs["report_to"] = "none"
+
+    if has_validation:
+        if "eval_steps" in supported:
+            filtered_kwargs["eval_steps"] = cfg.training.eval_steps
+
+        if "eval_strategy" in supported:
+            filtered_kwargs["eval_strategy"] = "steps"
+        elif "evaluation_strategy" in supported:
+            filtered_kwargs["evaluation_strategy"] = "steps"
+    else:
+        if "eval_strategy" in supported:
+            filtered_kwargs["eval_strategy"] = "no"
+        elif "evaluation_strategy" in supported:
+            filtered_kwargs["evaluation_strategy"] = "no"
+
+    if "save_safetensors" in supported:
+        filtered_kwargs["save_safetensors"] = True
+
+    return TrainingArguments(**filtered_kwargs)
+
+
+def _build_sft_trainer(
+    cfg: JobConfig,
+    model,
+    tokenizer,
+    train_dataset,
+    eval_dataset,
+    training_args: TrainingArguments,
+):
+    sig = inspect.signature(SFTTrainer.__init__)
+    supported = set(sig.parameters.keys())
+
+    kwargs = {
+        "model": model,
+        "args": training_args,
+        "train_dataset": train_dataset,
+    }
+
+    if eval_dataset is not None and "eval_dataset" in supported:
+        kwargs["eval_dataset"] = eval_dataset
+
+    if "processing_class" in supported:
+        kwargs["processing_class"] = tokenizer
+    elif "tokenizer" in supported:
+        kwargs["tokenizer"] = tokenizer
+
+    if "dataset_text_field" in supported:
+        kwargs["dataset_text_field"] = "text"
+
+    if "packing" in supported:
+        kwargs["packing"] = cfg.training.packing
+
+    if "max_seq_length" in supported:
+        kwargs["max_seq_length"] = cfg.training.max_seq_length
+
+    return SFTTrainer(**kwargs)
+
+
+def run_training(cfg: JobConfig, reporter: Optional[Reporter] = None) -> dict:
+    ensure_dirs(cfg)
+
+    model_name, load_in_4bit, logical_base_model_id = resolve_model_args(cfg)
+
+    logger.info("==> loading model: %s", model_name)
+    if logical_base_model_id:
+        logger.info("==> logical base model id: %s", logical_base_model_id)
+    logger.info("==> method: %s", cfg.training.method)
+
+    if reporter:
+        reporter.report_status(
+            "running",
+            stage="load_model",
+            progress=5,
+            message="loading base model",
+            extra={
+                "model_name": model_name,
+                "logical_base_model_id": logical_base_model_id,
+                "load_in_4bit": load_in_4bit,
+                "dtype": cfg.model.dtype,
+            },
+        )
+
+    model, tokenizer = FastLanguageModel.from_pretrained(
+        model_name=model_name,
+        max_seq_length=cfg.training.max_seq_length or cfg.model.max_seq_length,
+        dtype=torch.bfloat16 if cfg.training.bf16 else None,
+        load_in_4bit=load_in_4bit,
+        local_files_only=(cfg.model.source == "local"),
+        trust_remote_code=cfg.model.trust_remote_code,
+        device_map="auto",
+    )
+
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    if getattr(tokenizer, "padding_side", None) != "right":
+        tokenizer.padding_side = "right"
+
+    model = FastLanguageModel.get_peft_model(
+        model,
+        r=cfg.lora.r,
+        target_modules=cfg.lora.target_modules,
+        lora_alpha=cfg.lora.lora_alpha,
+        lora_dropout=cfg.lora.lora_dropout,
+        bias=cfg.lora.bias,
+        use_gradient_checkpointing=cfg.lora.use_gradient_checkpointing,
+        random_state=cfg.lora.random_state,
+    )
+
+    if not cfg.dataset.train_path:
+        raise ValueError("dataset.train_path is required for training")
+
+    if reporter:
+        reporter.report_status(
+            "running",
+            stage="load_dataset",
+            progress=15,
+            message="loading dataset",
+        )
+
+    data_files = {"train": cfg.dataset.train_path}
+    if cfg.dataset.val_path:
+        data_files["validation"] = cfg.dataset.val_path
+
+    dataset = load_dataset("json", data_files=data_files)
+
+    dataset = dataset.map(
+        lambda example: format_example(example, cfg, tokenizer),
+        desc="Formatting dataset",
+    )
+    dataset = dataset.filter(
+        lambda row: bool(str(row.get("text", "")).strip()),
+        desc="Filtering empty rows",
+    )
+
+    if len(dataset["train"]) == 0:
+        raise ValueError("Train dataset is empty after formatting/filtering")
+
+    checkpoint_dir = str(Path(cfg.outputs.checkpoints_dir) / cfg.job_name)
+    Path(checkpoint_dir).mkdir(parents=True, exist_ok=True)
+
+    training_args = _build_training_args(
+        cfg=cfg,
+        checkpoint_dir=checkpoint_dir,
+        has_validation="validation" in dataset,
+    )
+
+    trainer = _build_sft_trainer(
+        cfg=cfg,
+        model=model,
+        tokenizer=tokenizer,
+        train_dataset=dataset["train"],
+        eval_dataset=dataset["validation"] if "validation" in dataset else None,
+        training_args=training_args,
+    )
+
+    trainer.add_callback(TrainingProgressCallback(reporter))
+
+    logger.info("==> training started")
+    train_result = trainer.train()
+    logger.info("==> training finished")
+
+    lora_dir = Path(cfg.outputs.lora_dir) / cfg.job_name
+    merged_dir = Path(cfg.outputs.merged_dir) / cfg.job_name
+    metrics_path = Path(cfg.outputs.metrics_dir) / f"{cfg.job_name}.train_metrics.json"
+    history_path = Path(cfg.outputs.metrics_dir) / f"{cfg.job_name}.train_history.json"
+    train_summary_path = Path(cfg.outputs.metrics_dir) / f"{cfg.job_name}.train_summary.json"
+
+    lora_dir.mkdir(parents=True, exist_ok=True)
+    merged_dir.mkdir(parents=True, exist_ok=True)
+
+    if reporter:
+        reporter.report_status(
+            "running",
+            stage="save_lora",
+            progress=92,
+            message="saving lora adapters",
+            extra={"path": str(lora_dir)},
+        )
+
+    logger.info("==> saving lora adapters to %s", lora_dir)
+    model.save_pretrained(str(lora_dir))
+    tokenizer.save_pretrained(str(lora_dir))
+
+    merged_saved = False
+    if cfg.postprocess.merge_lora and cfg.postprocess.save_merged_16bit:
+        if reporter:
+            reporter.report_status(
+                "running",
+                stage="merge_lora",
+                progress=96,
+                message="saving merged model",
+                extra={"path": str(merged_dir)},
+            )
+
+        logger.info("==> saving merged model to %s", merged_dir)
+        logger.info("==> merged 16-bit save may take several minutes for 7B model")
+        model.save_pretrained_merged(
+            save_directory=str(merged_dir),
+            tokenizer=tokenizer,
+            save_method="merged_16bit",
+        )
+        logger.info("==> merged model saved")
+        merged_saved = True
+
+    metrics = dict(train_result.metrics)
+    history = trainer.state.log_history
+
+    final_loss = None
+    for entry in reversed(history):
+        if "loss" in entry:
+            final_loss = entry["loss"]
+            break
+
+    train_summary = {
+        "job_name": cfg.job_name,
+        "train_rows": len(dataset["train"]),
+        "validation_rows": len(dataset["validation"]) if "validation" in dataset else 0,
+        "method": cfg.training.method,
+        "base_model": model_name,
+        "base_model_id": logical_base_model_id,
+        "base_model_name_or_path": logical_base_model_id,
+        "load_in_4bit": load_in_4bit,
+        "bf16": cfg.training.bf16,
+        "merged_saved": merged_saved,
+        "train_runtime": metrics.get("train_runtime"),
+        "train_samples_per_second": metrics.get("train_samples_per_second"),
+        "train_steps_per_second": metrics.get("train_steps_per_second"),
+        "train_loss": metrics.get("train_loss"),
+        "final_loss": final_loss,
+    }
+
+    with metrics_path.open("w", encoding="utf-8") as f:
+        json.dump(metrics, f, indent=2, ensure_ascii=False)
+
+    with history_path.open("w", encoding="utf-8") as f:
+        json.dump(history, f, indent=2, ensure_ascii=False)
+
+    with train_summary_path.open("w", encoding="utf-8") as f:
+        json.dump(train_summary, f, indent=2, ensure_ascii=False)
+
+    logger.info("==> training artifacts saved")
+
+    if reporter:
+        reporter.report_status(
+            "running",
+            stage="train_completed",
+            progress=100,
+            message="training stage completed",
+            extra=train_summary,
+        )
+
+    try:
+        del trainer
+    except Exception:
+        pass
+
+    try:
+        torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+    return {
+        "status": "success",
+        "job_name": cfg.job_name,
+        "base_model": model_name,
+        "base_model_id": logical_base_model_id,
+        "base_model_name_or_path": logical_base_model_id,
+        "lora_dir": str(lora_dir),
+        "merged_dir": str(merged_dir) if merged_saved else None,
+        "checkpoint_dir": checkpoint_dir,
+        "metrics_path": str(metrics_path),
+        "history_path": str(history_path),
+        "train_summary_path": str(train_summary_path),
+        "summary": train_summary,
+    }
+
+
+path: /app/pipeline/upload_runner.py
+----------------------------------------
+import logging
+from pathlib import Path
+from typing import Any, Callable, Dict, Tuple
+
+from .archiver import Archiver
+from ..bootstrap.schemas import JobConfig
+
+logger = logging.getLogger(__name__)
+
+class UploadRunner:
+    def __init__(self, cfg: JobConfig):
+        self.cfg = cfg
+        self.archiver = Archiver()
+        self.session = self.archiver.session
+
+    def _headers(self) -> Dict[str, str]:
+        headers: Dict[str, str] = {}
+        if self.cfg.upload.auth.headers:
+            headers.update(self.cfg.upload.auth.headers)
+        if self.cfg.upload.auth.bearer_token:
+            headers["Authorization"] = f"Bearer {self.cfg.upload.auth.bearer_token}"
+        return headers
+
+    def _upload_file(self, file_path: str, upload_url: str, artifact_type: str) -> Dict[str, str]:
+        path = Path(file_path)
+        if not upload_url or not path.exists():
+            return {}
+
+        with path.open("rb") as f:
+            files = {"file": (path.name, f, "application/octet-stream")}
+            data = {
+                "job_id": self.cfg.job_id or self.cfg.job_name,
+                "job_name": self.cfg.job_name,
+                "artifact_type": artifact_type,
+            }
+            response = self.session.post(
+                upload_url,
+                files=files,
+                data=data,
+                headers=self._headers(),
+                timeout=(10, self.cfg.upload.timeout_sec),
+            )
+            response.raise_for_status()
+
+        return {"url": upload_url, "path": str(path)}
+
+    def _archive_and_upload_dir(
+        self,
+        dir_path: str,
+        upload_url: str,
+        archive_name: str,
+        artifact_type: str,
+    ) -> Dict[str, str]:
+        path = Path(dir_path)
+        if not upload_url or not path.exists():
+            return {}
+
+        archive_path = Path(self.cfg.outputs.base_dir) / archive_name
+        self.archiver.make_archive(
+            str(path),
+            str(archive_path),
+            exclude_names={"downloads", "__pycache__"},
+        )
+        self.archiver.upload_archive(
+            str(archive_path),
+            upload_url,
+            headers=self._headers(),
+            form_data={
+                "job_id": self.cfg.job_id or self.cfg.job_name,
+                "job_name": self.cfg.job_name,
+                "artifact_type": artifact_type,
+            },
+            timeout_sec=self.cfg.upload.timeout_sec,
+        )
+        return {"url": upload_url, "archive_path": str(archive_path)}
+
+    def _safe_upload(
+        self,
+        key: str,
+        operation: Callable[[], Dict[str, str]],
+        uploaded: Dict[str, Dict[str, str]],
+        errors: Dict[str, str],
+    ) -> None:
+        try:
+            result = operation()
+            if result:
+                uploaded[key] = result
+        except Exception as exc:
+            logger.exception("upload step failed: %s", key)
+            errors[key] = str(exc)
+
+    def upload_non_summary_artifacts(
+        self,
+        log_file: str,
+        effective_config_path: str,
+        training_result: Dict,
+        eval_result: Dict = None,
+    ) -> Tuple[Dict[str, Dict[str, str]], Dict[str, str]]:
+        uploaded: Dict[str, Dict[str, str]] = {}
+        errors: Dict[str, str] = {}
+
+        if self.cfg.upload.enabled and self.cfg.upload.target == "url":
+            targets = self.cfg.upload.url_targets
+
+            if targets.logs_url:
+                self._safe_upload(
+                    "logs",
+                    lambda: self._upload_file(log_file, targets.logs_url, "logs"),
+                    uploaded,
+                    errors,
+                )
+
+            if targets.effective_config_url:
+                self._safe_upload(
+                    "effective_config",
+                    lambda: self._upload_file(
+                        effective_config_path,
+                        targets.effective_config_url,
+                        "config",
+                    ),
+                    uploaded,
+                    errors,
+                )
+
+            metrics_path = training_result.get("metrics_path")
+            if targets.train_metrics_url and metrics_path:
+                self._safe_upload(
+                    "train_metrics",
+                    lambda: self._upload_file(
+                        metrics_path,
+                        targets.train_metrics_url,
+                        "train_metrics",
+                    ),
+                    uploaded,
+                    errors,
+                )
+
+            history_path = training_result.get("history_path")
+            if targets.train_history_url and history_path:
+                self._safe_upload(
+                    "train_history",
+                    lambda: self._upload_file(
+                        history_path,
+                        targets.train_history_url,
+                        "train_history",
+                    ),
+                    uploaded,
+                    errors,
+                )
+
+            lora_dir = training_result.get("lora_dir")
+            if targets.lora_archive_url and lora_dir:
+                self._safe_upload(
+                    "lora_archive",
+                    lambda: self._archive_and_upload_dir(
+                        lora_dir,
+                        targets.lora_archive_url,
+                        f"{self.cfg.job_name}.lora.tar.gz",
+                        "lora_archive",
+                    ),
+                    uploaded,
+                    errors,
+                )
+
+            merged_dir = training_result.get("merged_dir")
+            if targets.merged_archive_url and merged_dir and Path(merged_dir).exists():
+                self._safe_upload(
+                    "merged_archive",
+                    lambda: self._archive_and_upload_dir(
+                        merged_dir,
+                        targets.merged_archive_url,
+                        f"{self.cfg.job_name}.merged.tar.gz",
+                        "merged_archive",
+                    ),
+                    uploaded,
+                    errors,
+                )
+
+            if targets.full_archive_url:
+                self._safe_upload(
+                    "full_archive",
+                    lambda: self._archive_and_upload_dir(
+                        self.cfg.outputs.base_dir,
+                        targets.full_archive_url,
+                        f"{self.cfg.job_name}.full.tar.gz",
+                        "full_archive",
+                    ),
+                    uploaded,
+                    errors,
+                )
+
+            if eval_result:
+                if targets.eval_summary_url and eval_result.get("summary_json_path"):
+                    self._safe_upload(
+                        "eval_summary",
+                        lambda: self._upload_file(
+                            eval_result["summary_json_path"],
+                            targets.eval_summary_url,
+                            "evaluation_summary",
+                        ),
+                        uploaded,
+                        errors,
+                    )
+
+                if targets.eval_details_url and eval_result.get("detailed_csv_path"):
+                    self._safe_upload(
+                        "eval_details",
+                        lambda: self._upload_file(
+                            eval_result["detailed_csv_path"],
+                            targets.eval_details_url,
+                            "evaluation_details",
+                        ),
+                        uploaded,
+                        errors,
+                    )
+
+        return uploaded, errors
+
+    def upload_summary(self, summary_path: str) -> Dict[str, Dict[str, str]]:
+        uploaded: Dict[str, Dict[str, str]] = {}
+        if (
+            self.cfg.upload.enabled
+            and self.cfg.upload.target == "url"
+            and self.cfg.upload.url_targets.summary_url
+        ):
+            uploaded["summary"] = self._upload_file(
+                summary_path,
+                self.cfg.upload.url_targets.summary_url,
+                "job_summary",
+            )
+        return uploaded
 
 
 path: /app/runner.py
@@ -1839,16 +2957,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
-from archiver import Archiver
-from artifact_uploader import ArtifactUploader
-from asset_manager import AssetManager
-from bootstrap_loader import load_remote_job_config
-from config_loader import load_config
-from eval_runner import run_evaluation
-from hf_utils import try_hf_login
-from log_streamer import LogStreamer
-from reporter import Reporter
-from train_runner import run_training
+from .pipeline.archiver import Archiver
+from .pipeline.upload_runner import UploadRunner
+from .pipeline.publish_runner import PublishRunner
+from .pipeline.asset_manager import AssetManager
+from .bootstrap.bootstrap_loader import load_remote_job_config
+from .bootstrap.config_loader import load_config
+from .adapters.hf_utils import try_hf_login
+from .adapters.log_streamer import LogStreamer
+from .adapters.reporter import Reporter
 
 logger = logging.getLogger(__name__)
 
@@ -1953,12 +3070,32 @@ def main():
     reporter = Reporter(cfg)
     asset_manager = AssetManager(cfg)
     archiver = Archiver()
-    uploader = ArtifactUploader(cfg)
+    uploader = UploadRunner(cfg)
+    publisher = PublishRunner(cfg)
 
     effective_config_path = Path(cfg.outputs.logs_dir) / "effective-job.json"
     result_path = Path(cfg.outputs.base_dir) / "job-result.json"
 
     started_at = utc_now_iso()
+
+    # Heartbeat thread
+    import threading
+    import time
+    def heartbeat_loop():
+        while True:
+            try:
+                reporter.report_status(
+                    "running",
+                    message="Heartbeat",
+                    stage="heartbeat",
+                    extra={"heartbeat": True}
+                )
+            except Exception:
+                pass
+            time.sleep(30)
+
+    hb_thread = threading.Thread(target=heartbeat_loop, daemon=True)
+    hb_thread.start()
 
     try:
         reporter.report_status(
@@ -1981,71 +3118,29 @@ def main():
             progress=2,
         )
         try_hf_login()
-        uploader.ensure_hf_ready()
+        publisher.ensure_hf_ready()
 
         pipeline = cfg.pipeline
+        has_steps = pipeline and pipeline.steps
 
-        if not pipeline or pipeline.prepare_assets.enabled:
-            logger.info("==> preparing assets")
-            reporter.report_status(
-                "running",
-                message="Preparing datasets and remote assets",
-                stage="prepare_assets",
-                progress=5,
-            )
-            asset_manager.prepare_dataset(cfg)
-            asset_manager.prepare_evaluation_dataset(cfg)
+        if has_steps:
+            logger.info("==> executing pipeline steps")
         else:
-            logger.info("==> skipping assets preparation")
+            logger.warning("==> pipeline.steps missing, falling back to legacy sequence")
 
         training_result = {}
-        if not pipeline or pipeline.training.enabled:
-            logger.info("==> starting training")
-            training_result = run_training(cfg, reporter=reporter)
-
-            logical_base_model_id = cfg.model.logical_base_model_id
-            if logical_base_model_id and not training_result.get("base_model_id"):
-                training_result["base_model_id"] = logical_base_model_id
-                training_result["base_model_name_or_path"] = logical_base_model_id
-                summary = training_result.get("summary")
-                if isinstance(summary, dict):
-                    summary.setdefault("base_model_id", logical_base_model_id)
-                    summary.setdefault("base_model_name_or_path", logical_base_model_id)
-
-            logger.info("==> training finished")
-        else:
-            logger.info("==> skipping training stage")
-            training_result = {
-                "status": "skipped",
-                "message": "Training stage disabled in pipeline",
-            }
-
-        if cfg.postprocess.run_awq_quantization:
-            raise NotImplementedError("AWQ quantization stage is not implemented in this service yet")
-
         evaluation_result = None
-        should_eval = False
-        if pipeline:
-            should_eval = pipeline.evaluation.enabled
-        else:
-            should_eval = cfg.evaluation.enabled
-
-        if should_eval:
-            logger.info("==> starting evaluation")
-            evaluation_result = run_evaluation(cfg, training_result, reporter=reporter)
-            logger.info("==> evaluation finished")
-        else:
-            logger.info("==> skipping evaluation stage")
+        external_refs = []
 
         result: Dict[str, Any] = {
             "status": "success",
             "job_id": cfg.job_id or cfg.job_name,
             "job_name": cfg.job_name,
             "started_at": started_at,
-            "finished_at": utc_now_iso(),
+            "finished_at": None,
             "config_source": config_source,
-            "training": training_result,
-            "evaluation": evaluation_result,
+            "training": {},
+            "evaluation": None,
             "artifacts": {
                 "log_file": str(log_file),
                 "effective_config_path": str(effective_config_path),
@@ -2053,46 +3148,64 @@ def main():
             },
             "uploads": {},
             "upload_errors": {},
+            "externalRefs": external_refs,
         }
 
-        should_upload = False
-        if pipeline:
-            should_upload = pipeline.upload.enabled
-        else:
-            should_upload = cfg.upload.enabled
+        # Legacy sequence logic or Step-based execution
+        # For simplicity in v1, we process steps in order from cfg.pipeline.steps
+        # while maintaining compatibility with the runners.
 
-        if should_upload:
-            if cfg.upload.target == "url" and cfg.upload.upload_url:
-                logger.info("==> legacy full archive upload")
-                try:
-                    archive_path = Path(cfg.outputs.base_dir) / f"{cfg.job_name}.tar.gz"
-                    archiver.make_archive(cfg.outputs.base_dir, str(archive_path))
-                    archiver.upload_archive(
-                        str(archive_path),
-                        cfg.upload.upload_url,
-                        headers=uploader._headers(),
-                        form_data={
-                            "job_id": cfg.job_id or cfg.job_name,
-                            "job_name": cfg.job_name,
-                            "artifact_type": "full_archive",
-                        },
-                        timeout_sec=cfg.upload.timeout_sec,
-                    )
-                    result["uploads"]["legacy_full_archive"] = {
-                        "url": cfg.upload.upload_url,
-                        "archive_path": str(archive_path),
-                    }
-                except Exception as exc:
-                    logger.exception("legacy full archive upload failed")
-                    result["upload_errors"]["legacy_full_archive"] = str(exc)
+        def run_step(step_key, step_kind):
+            nonlocal training_result, evaluation_result
 
-            if cfg.upload.target == "url":
-                reporter.report_status(
-                    "running",
-                    message="Uploading URL artifacts",
-                    stage="upload_artifacts",
-                    progress=97,
+            if step_kind == "prepare_assets":
+                logger.info("==> preparing assets")
+                reporter.report_status("running", message="Preparing assets", stage="prepare_assets", progress=5)
+                asset_manager.prepare_dataset(cfg)
+                asset_manager.prepare_evaluation_dataset(cfg)
+
+            elif step_kind == "training":
+                from .pipeline.train_runner import run_training
+                logger.info("==> starting training")
+                training_result = run_training(cfg, reporter=reporter)
+                logical_base_model_id = cfg.model.logical_base_model_id
+                if logical_base_model_id and not training_result.get("base_model_id"):
+                    training_result["base_model_id"] = logical_base_model_id
+                result["training"] = training_result
+
+            elif step_kind == "evaluation":
+                from .pipeline.eval_runner import run_evaluation
+                logger.info("==> starting evaluation")
+                evaluation_result = run_evaluation(cfg, training_result, reporter=reporter)
+                result["evaluation"] = evaluation_result
+
+            elif step_kind == "publish_hf":
+                reporter.report_status("running", message="Publishing to HF", stage="publish", progress=90)
+                hf_model_uploads = publisher.upload_to_huggingface(training_result)
+                if hf_model_uploads:
+                    result["uploads"].update(hf_model_uploads)
+                    # Gather external refs from publish
+                    if hf_model_uploads.get("merged_model"):
+                        plan = hf_model_uploads["merged_model"].get("plan", {})
+                        external_refs.append({
+                            "backend": "huggingface",
+                            "repoId": plan.get("merged_repo"),
+                            "repoType": "model",
+                            "revision": plan.get("revision") or "main",
+                        })
+
+                hf_metadata_uploads = publisher.upload_hf_metadata(
+                    log_file=str(log_file),
+                    effective_config_path=str(effective_config_path),
+                    result_path=str(result_path),
+                    training_result=training_result,
+                    eval_result=evaluation_result,
                 )
+                if hf_metadata_uploads:
+                    result["uploads"].update(hf_metadata_uploads)
+
+            elif step_kind == "upload_artifacts":
+                reporter.report_status("running", message="Uploading artifacts", stage="upload", progress=95)
                 extra_uploads, extra_upload_errors = uploader.upload_non_summary_artifacts(
                     log_file=str(log_file),
                     effective_config_path=str(effective_config_path),
@@ -2103,43 +3216,33 @@ def main():
                     result["uploads"].update(extra_uploads)
                 if extra_upload_errors:
                     result["upload_errors"].update(extra_upload_errors)
+
+        if has_steps:
+            for step in pipeline.steps:
+                if step.enabled:
+                    run_step(step.key, step.kind)
+                else:
+                    logger.info("==> step %s disabled, skipping", step.key)
         else:
-            logger.info("==> skipping upload stage")
+            # Fallback legacy sequence
+            if not pipeline or pipeline.prepare_assets.enabled:
+                run_step("prepare_assets", "prepare_assets")
 
-        write_json(result_path, result)
+            if not pipeline or pipeline.training.enabled:
+                run_step("training", "training")
 
-        should_publish = False
-        if pipeline:
-            should_publish = pipeline.publish.enabled
-        else:
-            should_publish = cfg.huggingface.enabled
+            if (pipeline.evaluation.enabled if pipeline else cfg.evaluation.enabled):
+                run_step("evaluation", "evaluation")
 
-        if should_publish:
-            reporter.report_status(
-                "running",
-                message="Publishing artifacts to Hugging Face",
-                stage="publish_artifacts",
-                progress=98,
-            )
+            if (pipeline.publish.enabled if pipeline else cfg.huggingface.enabled):
+                run_step("publish", "publish_hf")
 
-            hf_model_uploads = uploader.upload_to_huggingface(training_result)
-            if hf_model_uploads:
-                result["uploads"].update(hf_model_uploads)
-                write_json(result_path, result)
+            if (pipeline.upload.enabled if pipeline else cfg.upload.enabled):
+                run_step("upload", "upload_artifacts")
 
-            hf_metadata_uploads = uploader.upload_hf_metadata(
-                log_file=str(log_file),
-                effective_config_path=str(effective_config_path),
-                result_path=str(result_path),
-                training_result=training_result,
-                eval_result=evaluation_result,
-            )
-            if hf_metadata_uploads:
-                result["uploads"].update(hf_metadata_uploads)
-                write_json(result_path, result)
-        else:
-            logger.info("==> skipping publish stage")
+        result["finished_at"] = utc_now_iso()
 
+        should_upload = pipeline.upload.enabled if pipeline else cfg.upload.enabled
         if should_upload and cfg.upload.target == "url" and cfg.upload.url_targets.summary_url:
             try:
                 summary_upload = uploader.upload_summary(str(result_path))
@@ -2152,7 +3255,9 @@ def main():
                 write_json(result_path, result)
 
         if result["upload_errors"]:
-            logger.warning("==> pipeline finished with upload warnings: %s", result["upload_errors"])
+            logger.warning("==> pipeline finished with upload warnings")
+            for key, value in result["upload_errors"].items():
+                logger.warning("==> upload warning [%s]: %s", key, value)
 
         logger.info("==> pipeline finished successfully")
         reporter.report_status(
@@ -2203,343 +3308,12 @@ if __name__ == "__main__":
     main()
 
 
-path: /app/schemas.py
+path: /app/tests/__init__.py
 ----------------------------------------
-from __future__ import annotations
 
-from pathlib import Path
-from typing import Dict, List, Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-DEFAULT_EVAL_PROMPT = """Ты — беспристрастный эксперт-оценщик. Тебе предоставлен вопрос и ответ кандидата.
-Твоя задача — выставить оценку от 0 до 5, где:
-5 — идеально правильный и полный ответ,
-0 — совершенно неверный или отсутствующий ответ.
-
-Теги вопроса: ${tagsText}
-Эти теги являются метаданными. Не завышай и не занижай оценку только из-за тегов.
-
-Вопрос: ${question}
-Ответ кандидата: ${candidateAnswer}
-
-Верни результат строго в формате JSON:
-{
-  "score": <число от 0 до 5>,
-  "feedback": "<краткое пояснение>"
-}
-
-Если не можешь вернуть JSON, обязательно напиши в конце: "score: X/5"
-"""
-
-
-class AppBaseModel(BaseModel):
-    model_config = ConfigDict(extra="ignore")
-
-
-class ModelConfig(AppBaseModel):
-    source: Literal["local", "huggingface"] = "local"
-    local_path: Optional[str] = None
-    repo_id: Optional[str] = None
-    revision: str = "main"
-    trust_remote_code: bool = False
-    load_in_4bit: Optional[bool] = None
-    dtype: Literal["auto", "float16", "bfloat16", "float32"] = "auto"
-    max_seq_length: int = 4096
-
-    base_model: Optional[str] = None
-    base_model_name_or_path: Optional[str] = None
-
-    @staticmethod
-    def _is_probably_local_path(value: str) -> bool:
-        value = str(value or "").strip()
-        if not value:
-            return False
-        if value.startswith("/"):
-            return True
-        if value.startswith("./") or value.startswith("../"):
-            return True
-        if value.startswith("\\") or "\\" in value:
-            return True
-        if len(value) > 1 and value[1] == ":":
-            return True
-        return False
-
-    @property
-    def logical_base_model_id(self) -> Optional[str]:
-        for candidate in (
-            self.repo_id,
-            self.base_model_name_or_path,
-            self.base_model,
-        ):
-            if not isinstance(candidate, str):
-                continue
-            value = candidate.strip()
-            if not value:
-                continue
-            if self._is_probably_local_path(value):
-                continue
-            return value
-        return None
-
-    @model_validator(mode="after")
-    def validate_source(self) -> "ModelConfig":
-        if self.source == "local" and not self.local_path:
-            raise ValueError("model.local_path is required when model.source='local'")
-        if self.source == "huggingface" and not self.repo_id:
-            raise ValueError("model.repo_id is required when model.source='huggingface'")
-        return self
-
-
-class DatasetConfig(AppBaseModel):
-    source: Literal["local", "url"] = "local"
-    train_path: Optional[str] = None
-    val_path: Optional[str] = None
-    train_url: Optional[str] = None
-    val_url: Optional[str] = None
-    format: Literal["instruction_output", "messages", "prompt_completion"] = "instruction_output"
-    input_field: str = "input"
-    output_field: str = "output"
-    messages_field: str = "messages"
-
-    @model_validator(mode="after")
-    def validate_dataset(self) -> "DatasetConfig":
-        if self.source == "local" and not self.train_path:
-            raise ValueError("dataset.train_path is required when dataset.source='local'")
-        if self.source == "url" and not self.train_url:
-            raise ValueError("dataset.train_url is required when dataset.source='url'")
-        return self
-
-
-class TrainingConfig(AppBaseModel):
-    method: Literal["lora", "qlora"] = "qlora"
-    max_seq_length: int = 4096
-    per_device_train_batch_size: int = 1
-    gradient_accumulation_steps: int = 8
-    num_train_epochs: int = 1
-    learning_rate: float = 1e-4
-    warmup_ratio: float = 0.03
-    logging_steps: int = 1
-    save_steps: int = 50
-    eval_steps: int = 50
-    bf16: bool = True
-    packing: bool = True
-    save_total_limit: int = 2
-    optim: str = "adamw_8bit"
-    output_dir: Optional[str] = None
-
-
-class LoraConfig(AppBaseModel):
-    r: int = 16
-    lora_alpha: int = 32
-    lora_dropout: float = 0.0
-    bias: str = "none"
-    use_gradient_checkpointing: str = "unsloth"
-    random_state: int = 3407
-    target_modules: List[str] = Field(default_factory=list)
-
-
-class OutputsConfig(AppBaseModel):
-    base_dir: str
-    logs_dir: Optional[str] = None
-    lora_dir: Optional[str] = None
-    checkpoints_dir: Optional[str] = None
-    metrics_dir: Optional[str] = None
-    merged_dir: Optional[str] = None
-    quantized_dir: Optional[str] = None
-    eval_dir: Optional[str] = None
-    downloads_dir: Optional[str] = None
-
-    @model_validator(mode="after")
-    def fill_defaults(self) -> "OutputsConfig":
-        base = Path(self.base_dir)
-
-        if not self.logs_dir:
-            self.logs_dir = str(base / "logs")
-        if not self.lora_dir:
-            self.lora_dir = str(base / "lora")
-        if not self.checkpoints_dir:
-            self.checkpoints_dir = str(base / "checkpoints")
-        if not self.metrics_dir:
-            self.metrics_dir = str(base / "metrics")
-        if not self.merged_dir:
-            self.merged_dir = str(base / "merged")
-        if not self.quantized_dir:
-            self.quantized_dir = str(base / "quantized")
-        if not self.eval_dir:
-            self.eval_dir = str(base / "evaluation")
-        if not self.downloads_dir:
-            self.downloads_dir = str(base / "downloads")
-
-        return self
-
-
-class PostprocessConfig(AppBaseModel):
-    merge_lora: bool = True
-    save_merged_16bit: bool = True
-    run_awq_quantization: bool = False
-
-
-class AuthConfig(AppBaseModel):
-    bearer_token: Optional[str] = None
-    headers: Dict[str, str] = Field(default_factory=dict)
-
-
-class CallbackConfig(AppBaseModel):
-    enabled: bool = False
-    url: Optional[str] = None
-    timeout_sec: int = 15
-    auth: AuthConfig = Field(default_factory=AuthConfig)
-
-    @property
-    def active(self) -> bool:
-        return self.enabled and bool(self.url)
-
-
-class ReportingConfig(AppBaseModel):
-    status: CallbackConfig = Field(default_factory=CallbackConfig)
-    progress: CallbackConfig = Field(default_factory=CallbackConfig)
-    final: CallbackConfig = Field(default_factory=CallbackConfig)
-    logs: CallbackConfig = Field(default_factory=CallbackConfig)
-
-
-class EvaluationDatasetConfig(AppBaseModel):
-    source: Literal["local", "url"] = "local"
-    path: Optional[str] = None
-    url: Optional[str] = None
-    format: Literal["json", "jsonl"] = "jsonl"
-    question_field: str = "question"
-    answer_field: str = "candidate_answer"
-    score_field: str = "reference_score"
-    max_score_field: Optional[str] = "max_score"
-    tags_field: Optional[str] = "hash_tags"
-
-    @model_validator(mode="after")
-    def validate_source(self) -> "EvaluationDatasetConfig":
-        if self.source == "local" and not self.path:
-            raise ValueError("evaluation.dataset.path is required when source='local'")
-        if self.source == "url" and not self.url:
-            raise ValueError("evaluation.dataset.url is required when source='url'")
-        return self
-
-
-class EvaluationConfig(AppBaseModel):
-    enabled: bool = False
-    target: Literal["auto", "lora", "merged"] = "auto"
-    max_samples: Optional[int] = None
-    max_new_tokens: int = 128
-    temperature: float = 0.0
-    do_sample: bool = False
-    system_prompt: Optional[str] = None
-    prompt_template: str = DEFAULT_EVAL_PROMPT
-    parsing_regex: Optional[str] = None
-    score_min: float = 0.0
-    score_max: float = 5.0
-    dataset: Optional[EvaluationDatasetConfig] = None
-
-    @model_validator(mode="after")
-    def validate_enabled(self) -> "EvaluationConfig":
-        if self.enabled and self.dataset is None:
-            raise ValueError("evaluation.dataset is required when evaluation.enabled=true")
-        return self
-
-
-class UrlArtifactTargets(AppBaseModel):
-    logs_url: Optional[str] = None
-    effective_config_url: Optional[str] = None
-    summary_url: Optional[str] = None
-    train_metrics_url: Optional[str] = None
-    train_history_url: Optional[str] = None
-    eval_summary_url: Optional[str] = None
-    eval_details_url: Optional[str] = None
-    lora_archive_url: Optional[str] = None
-    merged_archive_url: Optional[str] = None
-    full_archive_url: Optional[str] = None
-
-
-class UploadConfig(AppBaseModel):
-    enabled: bool = False
-    target: Literal["local", "huggingface", "url"] = "local"
-    upload_url: Optional[str] = None
-    timeout_sec: int = 120
-    auth: AuthConfig = Field(default_factory=AuthConfig)
-    url_targets: UrlArtifactTargets = Field(default_factory=UrlArtifactTargets)
-
-    repo_id_lora: Optional[str] = None
-    repo_id_merged: Optional[str] = None
-    repo_id_metadata: Optional[str] = None
-    private: bool = True
-    commit_message: str = "trainer-service upload"
-
-
-class HuggingFacePublishConfig(AppBaseModel):
-    enabled: bool = False
-    push_lora: bool = False
-    push_merged: bool = False
-    repo_id_lora: Optional[str] = None
-    repo_id_merged: Optional[str] = None
-    repo_id_metadata: Optional[str] = None
-    private: bool = True
-    commit_message: str = "trainer-service upload"
-    revision: Optional[str] = None
-
-
-class PipelineStage(AppBaseModel):
-    enabled: bool = True
-
-
-class TrainingStage(PipelineStage, TrainingConfig):
-    pass
-
-
-class MergeStage(PipelineStage, PostprocessConfig):
-    pass
-
-
-class EvaluationStage(PipelineStage, EvaluationConfig):
-    pass
-
-
-class PublishStage(PipelineStage, HuggingFacePublishConfig):
-    pass
-
-
-class UploadStage(PipelineStage, UploadConfig):
-    pass
-
-
-class PipelineConfig(AppBaseModel):
-    prepare_assets: PipelineStage = Field(default_factory=PipelineStage)
-    training: TrainingStage = Field(default_factory=TrainingStage)
-    merge: MergeStage = Field(default_factory=MergeStage)
-    evaluation: EvaluationStage = Field(default_factory=EvaluationStage)
-    publish: PublishStage = Field(default_factory=PublishStage)
-    upload: UploadStage = Field(default_factory=UploadStage)
-
-
-class JobConfig(AppBaseModel):
-    job_id: Optional[str] = None
-    job_name: str
-    mode: Literal["local", "remote", "auto"] = "auto"
-
-    model: ModelConfig
-    dataset: DatasetConfig
-    training: TrainingConfig
-    lora: LoraConfig
-    outputs: OutputsConfig
-
-    postprocess: PostprocessConfig = Field(default_factory=PostprocessConfig)
-    evaluation: EvaluationConfig = Field(default_factory=EvaluationConfig)
-    upload: UploadConfig = Field(default_factory=UploadConfig)
-    huggingface: HuggingFacePublishConfig = Field(default_factory=HuggingFacePublishConfig)
-    reporting: ReportingConfig = Field(default_factory=ReportingConfig)
-
-    pipeline: Optional[PipelineConfig] = None
-
-    report_url: Optional[str] = None
-
-
-path: /app/test_remote_flow.py
+path: /app/tests/test_remote_flow.py
 ----------------------------------------
 import json
 import sys
@@ -2785,481 +3559,6 @@ class TestRemoteFlow(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
-
-path: /app/train_runner.py
-----------------------------------------
-from __future__ import annotations
-
-import inspect
-import json
-import logging
-import math
-import os
-from pathlib import Path
-from typing import Any, Dict, Optional
-
-os.environ["WANDB_DISABLED"] = "true"
-
-import unsloth
-from unsloth import FastLanguageModel
-
-import torch
-from datasets import load_dataset
-from transformers import TrainerCallback, TrainingArguments
-from trl import SFTTrainer
-
-from reporter import Reporter
-from schemas import JobConfig
-
-logger = logging.getLogger(__name__)
-
-
-def ensure_dirs(cfg: JobConfig) -> None:
-    for path in [
-        cfg.outputs.base_dir,
-        cfg.outputs.logs_dir,
-        cfg.outputs.lora_dir,
-        cfg.outputs.checkpoints_dir,
-        cfg.outputs.metrics_dir,
-        cfg.outputs.merged_dir,
-        cfg.outputs.quantized_dir,
-        cfg.outputs.eval_dir,
-        cfg.outputs.downloads_dir,
-    ]:
-        Path(path).mkdir(parents=True, exist_ok=True)
-
-
-def resolve_model_args(cfg: JobConfig) -> tuple[str, bool, Optional[str]]:
-    if cfg.model.source == "local":
-        model_name = cfg.model.local_path
-    else:
-        model_name = cfg.model.repo_id
-
-    if not model_name:
-        raise ValueError("Model path/repo_id is empty")
-
-    load_in_4bit = (
-        bool(cfg.model.load_in_4bit)
-        if cfg.model.load_in_4bit is not None
-        else (cfg.training.method == "qlora")
-    )
-
-    logical_base_model_id = cfg.model.logical_base_model_id
-
-    return model_name, load_in_4bit, logical_base_model_id
-
-
-def safe_float(value: Any) -> Optional[float]:
-    try:
-        parsed = float(value)
-        if math.isfinite(parsed):
-            return parsed
-    except Exception:
-        pass
-    return None
-
-
-def build_text_from_messages(messages: list[dict], tokenizer) -> str:
-    try:
-        return tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=False,
-        )
-    except Exception:
-        parts = []
-        for msg in messages:
-            role = msg.get("role", "user")
-            content = msg.get("content", "")
-            parts.append(f"{role.upper()}: {content}")
-        return "\n".join(parts)
-
-
-def format_example(example: Dict[str, Any], cfg: JobConfig, tokenizer) -> Dict[str, str]:
-    if cfg.dataset.format == "instruction_output":
-        input_value = str(example.get(cfg.dataset.input_field, "") or "").strip()
-        output_value = str(example.get(cfg.dataset.output_field, "") or "").strip()
-        text = (
-            f"### Instruction:\n{input_value}\n\n"
-            f"### Response:\n{output_value}{tokenizer.eos_token}"
-        )
-        return {"text": text}
-
-    if cfg.dataset.format == "prompt_completion":
-        prompt_value = str(example.get(cfg.dataset.input_field, "") or "").strip()
-        completion_value = str(example.get(cfg.dataset.output_field, "") or "").strip()
-        text = f"{prompt_value}{completion_value}{tokenizer.eos_token}"
-        return {"text": text}
-
-    if cfg.dataset.format == "messages":
-        messages = example.get(cfg.dataset.messages_field) or example.get("messages") or []
-        if not isinstance(messages, list):
-            return {"text": ""}
-        text = build_text_from_messages(messages, tokenizer)
-        if tokenizer.eos_token and not text.endswith(tokenizer.eos_token):
-            text = f"{text}{tokenizer.eos_token}"
-        return {"text": text}
-
-    raise ValueError(f"Unsupported dataset format: {cfg.dataset.format}")
-
-
-class TrainingProgressCallback(TrainerCallback):
-    def __init__(self, reporter: Optional[Reporter]):
-        self.reporter = reporter
-
-    def on_train_begin(self, args, state, control, **kwargs):
-        if not self.reporter:
-            return
-        self.reporter.report_status(
-            "running",
-            stage="training",
-            progress=0,
-            message="training started",
-            extra={"max_steps": int(state.max_steps or 0)},
-        )
-
-    def on_log(self, args, state, control, logs=None, **kwargs):
-        if not self.reporter or not logs:
-            return
-
-        max_steps = int(state.max_steps or 0)
-        progress = round((int(state.global_step) / max_steps) * 100, 2) if max_steps > 0 else None
-
-        payload = {
-            "step": int(state.global_step),
-            "epoch": safe_float(state.epoch),
-            **logs,
-        }
-
-        self.reporter.report_progress(
-            stage="training",
-            progress=progress,
-            message="trainer log",
-            extra=payload,
-        )
-
-    def on_save(self, args, state, control, **kwargs):
-        if not self.reporter:
-            return
-
-        max_steps = int(state.max_steps or 0)
-        progress = round((int(state.global_step) / max_steps) * 100, 2) if max_steps > 0 else None
-
-        self.reporter.report_progress(
-            stage="training",
-            progress=progress,
-            message="checkpoint saved",
-            extra={"step": int(state.global_step)},
-        )
-
-    def on_train_end(self, args, state, control, **kwargs):
-        if not self.reporter:
-            return
-        self.reporter.report_status(
-            "running",
-            stage="training",
-            progress=100,
-            message="training finished",
-            extra={"step": int(state.global_step)},
-        )
-
-
-def _build_training_args(cfg: JobConfig, checkpoint_dir: str, has_validation: bool) -> TrainingArguments:
-    common_kwargs = {
-        "output_dir": checkpoint_dir,
-        "per_device_train_batch_size": cfg.training.per_device_train_batch_size,
-        "gradient_accumulation_steps": cfg.training.gradient_accumulation_steps,
-        "warmup_ratio": cfg.training.warmup_ratio,
-        "num_train_epochs": cfg.training.num_train_epochs,
-        "learning_rate": cfg.training.learning_rate,
-        "bf16": cfg.training.bf16,
-        "fp16": not cfg.training.bf16,
-        "logging_steps": cfg.training.logging_steps,
-        "save_steps": cfg.training.save_steps,
-        "save_strategy": "steps",
-        "save_total_limit": cfg.training.save_total_limit,
-        "optim": cfg.training.optim,
-        "report_to": [],
-        "push_to_hub": False,
-        "logging_dir": cfg.outputs.logs_dir,
-    }
-
-    sig = inspect.signature(TrainingArguments.__init__)
-    supported = set(sig.parameters.keys())
-
-    filtered_kwargs = {k: v for k, v in common_kwargs.items() if k in supported}
-
-    if has_validation:
-        if "eval_steps" in supported:
-            filtered_kwargs["eval_steps"] = cfg.training.eval_steps
-
-        if "eval_strategy" in supported:
-            filtered_kwargs["eval_strategy"] = "steps"
-        elif "evaluation_strategy" in supported:
-            filtered_kwargs["evaluation_strategy"] = "steps"
-    else:
-        if "eval_strategy" in supported:
-            filtered_kwargs["eval_strategy"] = "no"
-        elif "evaluation_strategy" in supported:
-            filtered_kwargs["evaluation_strategy"] = "no"
-
-    if "save_safetensors" in supported:
-        filtered_kwargs["save_safetensors"] = True
-
-    return TrainingArguments(**filtered_kwargs)
-
-
-def _build_sft_trainer(
-    cfg: JobConfig,
-    model,
-    tokenizer,
-    train_dataset,
-    eval_dataset,
-    training_args: TrainingArguments,
-):
-    sig = inspect.signature(SFTTrainer.__init__)
-    supported = set(sig.parameters.keys())
-
-    kwargs = {
-        "model": model,
-        "args": training_args,
-        "train_dataset": train_dataset,
-    }
-
-    if eval_dataset is not None and "eval_dataset" in supported:
-        kwargs["eval_dataset"] = eval_dataset
-
-    if "processing_class" in supported:
-        kwargs["processing_class"] = tokenizer
-    elif "tokenizer" in supported:
-        kwargs["tokenizer"] = tokenizer
-
-    if "dataset_text_field" in supported:
-        kwargs["dataset_text_field"] = "text"
-
-    if "packing" in supported:
-        kwargs["packing"] = cfg.training.packing
-
-    if "max_seq_length" in supported:
-        kwargs["max_seq_length"] = cfg.training.max_seq_length
-
-    return SFTTrainer(**kwargs)
-
-
-def run_training(cfg: JobConfig, reporter: Optional[Reporter] = None) -> dict:
-    ensure_dirs(cfg)
-
-    model_name, load_in_4bit, logical_base_model_id = resolve_model_args(cfg)
-
-    logger.info("==> loading model: %s", model_name)
-    if logical_base_model_id:
-        logger.info("==> logical base model id: %s", logical_base_model_id)
-    logger.info("==> method: %s", cfg.training.method)
-
-    if reporter:
-        reporter.report_status(
-            "running",
-            stage="load_model",
-            progress=5,
-            message="loading base model",
-            extra={
-                "model_name": model_name,
-                "logical_base_model_id": logical_base_model_id,
-                "load_in_4bit": load_in_4bit,
-                "dtype": cfg.model.dtype,
-            },
-        )
-
-    model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name=model_name,
-        max_seq_length=cfg.training.max_seq_length or cfg.model.max_seq_length,
-        dtype=torch.bfloat16 if cfg.training.bf16 else None,
-        load_in_4bit=load_in_4bit,
-        local_files_only=(cfg.model.source == "local"),
-        trust_remote_code=cfg.model.trust_remote_code,
-        device_map="auto",
-    )
-
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    model = FastLanguageModel.get_peft_model(
-        model,
-        r=cfg.lora.r,
-        target_modules=cfg.lora.target_modules,
-        lora_alpha=cfg.lora.lora_alpha,
-        lora_dropout=cfg.lora.lora_dropout,
-        bias=cfg.lora.bias,
-        use_gradient_checkpointing=cfg.lora.use_gradient_checkpointing,
-        random_state=cfg.lora.random_state,
-    )
-
-    if not cfg.dataset.train_path:
-        raise ValueError("dataset.train_path is required for training")
-
-    if reporter:
-        reporter.report_status(
-            "running",
-            stage="load_dataset",
-            progress=15,
-            message="loading dataset",
-        )
-
-    data_files = {"train": cfg.dataset.train_path}
-    if cfg.dataset.val_path:
-        data_files["validation"] = cfg.dataset.val_path
-
-    dataset = load_dataset("json", data_files=data_files)
-
-    dataset = dataset.map(
-        lambda example: format_example(example, cfg, tokenizer),
-        desc="Formatting dataset",
-    )
-    dataset = dataset.filter(
-        lambda row: bool(str(row.get("text", "")).strip()),
-        desc="Filtering empty rows",
-    )
-
-    if len(dataset["train"]) == 0:
-        raise ValueError("Train dataset is empty after formatting/filtering")
-
-    checkpoint_dir = str(Path(cfg.outputs.checkpoints_dir) / cfg.job_name)
-    Path(checkpoint_dir).mkdir(parents=True, exist_ok=True)
-
-    training_args = _build_training_args(
-        cfg=cfg,
-        checkpoint_dir=checkpoint_dir,
-        has_validation="validation" in dataset,
-    )
-
-    trainer = _build_sft_trainer(
-        cfg=cfg,
-        model=model,
-        tokenizer=tokenizer,
-        train_dataset=dataset["train"],
-        eval_dataset=dataset["validation"] if "validation" in dataset else None,
-        training_args=training_args,
-    )
-
-    trainer.add_callback(TrainingProgressCallback(reporter))
-
-    logger.info("==> training started")
-    train_result = trainer.train()
-    logger.info("==> training finished")
-
-    lora_dir = Path(cfg.outputs.lora_dir) / cfg.job_name
-    merged_dir = Path(cfg.outputs.merged_dir) / cfg.job_name
-    metrics_path = Path(cfg.outputs.metrics_dir) / f"{cfg.job_name}.train_metrics.json"
-    history_path = Path(cfg.outputs.metrics_dir) / f"{cfg.job_name}.train_history.json"
-    train_summary_path = Path(cfg.outputs.metrics_dir) / f"{cfg.job_name}.train_summary.json"
-
-    lora_dir.mkdir(parents=True, exist_ok=True)
-    merged_dir.mkdir(parents=True, exist_ok=True)
-
-    if reporter:
-        reporter.report_status(
-            "running",
-            stage="save_lora",
-            progress=92,
-            message="saving lora adapters",
-            extra={"path": str(lora_dir)},
-        )
-
-    logger.info("==> saving lora adapters to %s", lora_dir)
-    model.save_pretrained(str(lora_dir))
-    tokenizer.save_pretrained(str(lora_dir))
-
-    merged_saved = False
-    if cfg.postprocess.merge_lora and cfg.postprocess.save_merged_16bit:
-        if reporter:
-            reporter.report_status(
-                "running",
-                stage="merge_lora",
-                progress=96,
-                message="saving merged model",
-                extra={"path": str(merged_dir)},
-            )
-
-        logger.info("==> saving merged model to %s", merged_dir)
-        model.save_pretrained_merged(
-            save_directory=str(merged_dir),
-            tokenizer=tokenizer,
-            save_method="merged_16bit",
-        )
-        merged_saved = True
-
-    metrics = dict(train_result.metrics)
-    history = trainer.state.log_history
-
-    final_loss = None
-    for entry in reversed(history):
-        if "loss" in entry:
-            final_loss = entry["loss"]
-            break
-
-    train_summary = {
-        "job_name": cfg.job_name,
-        "train_rows": len(dataset["train"]),
-        "validation_rows": len(dataset["validation"]) if "validation" in dataset else 0,
-        "method": cfg.training.method,
-        "base_model": model_name,
-        "base_model_id": logical_base_model_id,
-        "base_model_name_or_path": logical_base_model_id,
-        "load_in_4bit": load_in_4bit,
-        "bf16": cfg.training.bf16,
-        "merged_saved": merged_saved,
-        "train_runtime": metrics.get("train_runtime"),
-        "train_samples_per_second": metrics.get("train_samples_per_second"),
-        "train_steps_per_second": metrics.get("train_steps_per_second"),
-        "train_loss": metrics.get("train_loss"),
-        "final_loss": final_loss,
-    }
-
-    with metrics_path.open("w", encoding="utf-8") as f:
-        json.dump(metrics, f, indent=2, ensure_ascii=False)
-
-    with history_path.open("w", encoding="utf-8") as f:
-        json.dump(history, f, indent=2, ensure_ascii=False)
-
-    with train_summary_path.open("w", encoding="utf-8") as f:
-        json.dump(train_summary, f, indent=2, ensure_ascii=False)
-
-    logger.info("==> training artifacts saved")
-
-    if reporter:
-        reporter.report_status(
-            "running",
-            stage="train_completed",
-            progress=100,
-            message="training stage completed",
-            extra=train_summary,
-        )
-
-    try:
-        del trainer
-    except Exception:
-        pass
-
-    try:
-        torch.cuda.empty_cache()
-    except Exception:
-        pass
-
-    return {
-        "status": "success",
-        "job_name": cfg.job_name,
-        "base_model": model_name,
-        "base_model_id": logical_base_model_id,
-        "base_model_name_or_path": logical_base_model_id,
-        "lora_dir": str(lora_dir),
-        "merged_dir": str(merged_dir) if merged_saved else None,
-        "checkpoint_dir": checkpoint_dir,
-        "metrics_path": str(metrics_path),
-        "history_path": str(history_path),
-        "train_summary_path": str(train_summary_path),
-        "summary": train_summary,
-    }
 
 
 path: /bundle-code.js
@@ -3553,17 +3852,11 @@ RUN python3 -m venv /opt/venv
 
 WORKDIR /trainer
 
-# Копируем все предварительно скачанные wheel-файлы
-COPY packages/pip /wheels/pip
+# Устанавливаем зависимости из requirements.txt
 COPY requirements.txt /trainer/requirements.txt
 
 RUN pip install -U pip setuptools wheel
-
-# Устанавливаем только те пакеты, которые указаны в requirements.txt,
-# используя локальные колёса (--find-links) и без обращения в интернет (--no-index).
-# Pip сам разрешит и установит все необходимые зависимости (включая транзитивные,
-# такие как urllib3, idna и т.д.) из папки /wheels/pip.
-RUN pip install -r /trainer/requirements.txt --no-index --find-links /wheels/pip --break-system-packages
+RUN pip install -r /trainer/requirements.txt --break-system-packages
 
 COPY app /trainer/app
 COPY docker/entrypoint.sh /trainer/entrypoint.sh
@@ -3585,13 +3878,13 @@ echo "==> trainer-service starting"
 
 if [ "$#" -gt 0 ]; then
   echo "==> launching with explicit CLI args: $*"
-  exec python /trainer/app/runner.py "$@"
+  exec python -m app.runner "$@"
 fi
 
 if [ -n "${JOB_CONFIG_URL:-}" ]; then
   echo "==> remote bootstrap via JOB_CONFIG_URL"
   echo "==> job config url: ${JOB_CONFIG_URL}"
-  exec python /trainer/app/runner.py --job-config-url "${JOB_CONFIG_URL}"
+  exec python -m app.runner --job-config-url "${JOB_CONFIG_URL}"
 fi
 
 CONFIG_SOURCE="${CONFIG_SOURCE:-local}"
@@ -3612,7 +3905,7 @@ if [ "${CONFIG_SOURCE}" = "remote" ]; then
     exit 1
   fi
 
-  exec python /trainer/app/runner.py --config "${CONFIG_REF}"
+  exec python -m app.runner --config "${CONFIG_REF}"
 fi
 
 if [ -z "${CONFIG_REF}" ]; then
@@ -3624,7 +3917,7 @@ if [ ! -f "${CONFIG_REF}" ]; then
   exit 1
 fi
 
-exec python /trainer/app/runner.py --config "${CONFIG_REF}"
+exec python -m app.runner --config "${CONFIG_REF}"
 
 
 path: /docker-compose.local.yml
@@ -4629,8 +4922,8 @@ requests>=2.32.3
 
 
 === SUMMARY ===
-included: 27
+included: 32
 skipped(binary): 0
 skipped(size): 0
 skipped(ext): 0
-totalBytes(approx): 140551
+totalBytes(approx): 148933

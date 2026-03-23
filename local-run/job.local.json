@@ -8,19 +8,18 @@
     "trust_remote_code": false,
     "load_in_4bit": true,
     "dtype": "bfloat16",
-    "max_seq_length": 128
+    "max_seq_length": 256
   },
   "dataset": {
     "source": "local",
-    "train_path": "/data/train.json",
-    "val_path": "/data/val.json",
+    "train_path": "/data/train.jsonl",
     "format": "instruction_output",
     "input_field": "input",
     "output_field": "output"
   },
   "training": {
     "method": "qlora",
-    "max_seq_length": 128,
+    "max_seq_length": 256,
     "per_device_train_batch_size": 1,
     "gradient_accumulation_steps": 1,
     "num_train_epochs": 1,
@@ -53,20 +52,27 @@
   },
   "evaluation": {
     "enabled": true,
+    "engine": "vllm",
     "target": "merged",
-    "max_samples": 5,
-    "max_new_tokens": 32,
-    "temperature": 0,
+    "batch_size": 32,
+    "max_num_seqs": 8,
+    "max_num_batched_tokens": 8192,
+    "tensor_parallel_size": 1,
+    "gpu_memory_utilization": 0.9,
+    "max_new_tokens": 8,
+    "temperature": 0.0,
     "do_sample": false,
+    "score_min": 0.0,
+    "score_max": 5.0,
+    "parsing_regex": "^\\s*([0-5](?:\\.0)?)\\s*$",
     "dataset": {
       "source": "local",
       "path": "/data/eval.jsonl",
       "format": "jsonl",
-      "question_field": "question",
-      "answer_field": "candidate_answer",
-      "score_field": "reference_score",
-      "max_score_field": "max_score",
-      "tags_field": "hash_tags"
+      "task": "score_prediction",
+      "prompt_field": "input",
+      "score_field": "output",
+      "tags_field": "details.hash"
     }
   },
   "upload": {
