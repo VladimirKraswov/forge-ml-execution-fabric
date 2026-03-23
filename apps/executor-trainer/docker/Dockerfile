@@ -26,20 +26,24 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /trainer
 
 COPY requirements.txt /trainer/requirements.txt
+COPY packages /trainer/packages
+COPY docker/install_with_local_wheels.sh /trainer/install_with_local_wheels.sh
+
+RUN chmod +x /trainer/install_with_local_wheels.sh && \
+    mkdir -p /trainer/packages/pip
 
 # train env
 RUN python3 -m venv /opt/venv
 RUN /opt/venv/bin/pip install -U pip setuptools wheel
-RUN /opt/venv/bin/pip install -r /trainer/requirements.txt --break-system-packages
+RUN /trainer/install_with_local_wheels.sh /opt/venv/bin/python --requirements /trainer/requirements.txt /trainer/packages/pip
 
 # separate vLLM env
 RUN python3 -m venv /opt/vllm-venv
-RUN /opt/vllm-venv/bin/pip install -U pip setuptools wheel uv
+RUN /opt/vllm-venv/bin/pip install -U pip setuptools wheel
 
-# Let uv choose matching torch backend automatically for the machine/driver.
-RUN UV_TORCH_BACKEND=auto /opt/vllm-venv/bin/uv pip install \
-    --python /opt/vllm-venv/bin/python \
-    vllm
+# If vllm wheel exists in ./packages/pip it will be used first.
+# Missing deps will be resolved from local wheels too, and only then from network.
+RUN /trainer/install_with_local_wheels.sh /opt/vllm-venv/bin/python --package vllm /trainer/packages/pip
 
 COPY app /trainer/app
 COPY docker/entrypoint.sh /trainer/entrypoint.sh
