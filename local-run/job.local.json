@@ -80,37 +80,98 @@
   },
   "jobs": [
     {
-      "job_id": "java_local_01",
-      "job_name": "java-local-01",
+      "job_id": "local_run",
+      "job_name": "local-run",
+      "mode": "local",
+      "model": {
+        "source": "local",
+        "local_path": "/app",
+        "trust_remote_code": false,
+        "load_in_4bit": true,
+        "dtype": "bfloat16",
+        "max_seq_length": 256
+      },
       "dataset": {
         "source": "local",
-        "train_path": "/data/java/train.jsonl",
+        "train_path": "/data/train.jsonl",
         "format": "instruction_output",
         "input_field": "input",
         "output_field": "output"
       },
+      "training": {
+        "method": "qlora",
+        "max_seq_length": 256,
+        "per_device_train_batch_size": 1,
+        "gradient_accumulation_steps": 1,
+        "num_train_epochs": 1,
+        "learning_rate": 0.0001,
+        "warmup_ratio": 0.03,
+        "logging_steps": 1,
+        "save_steps": 10,
+        "eval_steps": 10,
+        "bf16": true,
+        "packing": false,
+        "save_total_limit": 1,
+        "optim": "adamw_8bit"
+      },
+      "lora": {
+        "r": 8,
+        "lora_alpha": 16,
+        "lora_dropout": 0.0,
+        "bias": "none",
+        "use_gradient_checkpointing": "unsloth",
+        "random_state": 3407,
+        "target_modules": [
+          "q_proj",
+          "k_proj",
+          "v_proj",
+          "o_proj"
+        ]
+      },
+      "outputs": {
+        "base_dir": "/output"
+      },
+      "postprocess": {
+        "merge_lora": true,
+        "save_merged_16bit": true,
+        "run_awq_quantization": false
+      },
       "evaluation": {
+        "enabled": true,
+        "engine": "vllm",
+        "target": "merged",
+        "batch_size": 32,
+        "max_num_seqs": 8,
+        "max_num_batched_tokens": 8192,
+        "tensor_parallel_size": 1,
+        "gpu_memory_utilization": 0.9,
+        "max_new_tokens": 8,
+        "temperature": 0.0,
+        "do_sample": false,
+        "score_min": 0.0,
+        "score_max": 5.0,
+        "parsing_regex": "^\\s*([0-5](?:\\.0)?)\\s*$",
         "dataset": {
-          "path": "/data/java/eval.jsonl"
+          "source": "local",
+          "path": "/data/eval.jsonl",
+          "format": "jsonl",
+          "task": "score_prediction",
+          "prompt_field": "input",
+          "score_field": "output",
+          "tags_field": "details.hash"
         }
-      }
-    },
-    {
-      "job_id": "spring_local_01",
-      "job_name": "spring-local-01",
-      "dataset": {
-        "source": "local",
-        "train_path": "/data/spring/train.jsonl",
-        "format": "instruction_output",
-        "input_field": "input",
-        "output_field": "output"
       },
-      "evaluation": {
-        "dataset": {
-          "path": "/data/spring/eval.jsonl"
-        },
-        "batch_size": 16,
-        "max_num_seqs": 4
+      "upload": {
+        "enabled": false
+      },
+      "huggingface": {
+        "enabled": false
+      },
+      "reporting": {
+        "status": { "enabled": false },
+        "progress": { "enabled": false },
+        "final": { "enabled": false },
+        "logs": { "enabled": false }
       }
     }
   ]
