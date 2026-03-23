@@ -19,7 +19,6 @@ from .adapters.log_streamer import LogStreamer
 from .adapters.reporter import Reporter
 from .bootstrap.bootstrap_loader import load_remote_job_config
 from .bootstrap.config_loader import load_config, load_config_bundle
-from .pipeline.archiver import Archiver
 from .pipeline.asset_manager import AssetManager
 from .pipeline.publish_runner import PublishRunner
 from .pipeline.upload_runner import UploadRunner
@@ -177,7 +176,10 @@ def apply_run_output_paths(cfg) -> Tuple[str, Path]:
     return run_name, run_root
 
 
-def cleanup_runtime() -> None:
+def cleanup_runtime(stage: str | None = None) -> None:
+    if stage:
+        logger.info("==> cleaning runtime after %s", stage)
+
     try:
         gc.collect()
     except Exception:
@@ -185,7 +187,18 @@ def cleanup_runtime() -> None:
 
     try:
         if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+            try:
+                torch.cuda.synchronize()
+            except Exception:
+                pass
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+            try:
+                torch.cuda.ipc_collect()
+            except Exception:
+                pass
     except Exception:
         pass
 
@@ -193,6 +206,8 @@ def cleanup_runtime() -> None:
 def run_single_job(cfg, config_source: str, bootstrap_meta: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     bootstrap_meta = bootstrap_meta or {}
     cfg = copy.deepcopy(cfg)
+
+    cleanup_runtime("previous-job")
 
     run_name, run_root = apply_run_output_paths(cfg)
     Path(cfg.outputs.base_dir).mkdir(parents=True, exist_ok=True)
@@ -213,7 +228,6 @@ def run_single_job(cfg, config_source: str, bootstrap_meta: Optional[Dict[str, A
 
     reporter = Reporter(cfg)
     asset_manager = AssetManager(cfg)
-    archiver = Archiver()
     uploader = UploadRunner(cfg)
     publisher = PublishRunner(cfg)
 
@@ -287,9 +301,15 @@ def run_single_job(cfg, config_source: str, bootstrap_meta: Optional[Dict[str, A
 
             if step_kind == "prepare_assets":
                 logger.info("==> preparing assets")
-                reporter.report_status("running", message="Preparing assets", stage="prepare_assets", progress=5)
+                reporter.report_status(
+                    "running",
+                    message="Preparing assets",
+                    stage="prepare_assets",
+                    progress=5,
+                )
                 asset_manager.prepare_dataset(cfg)
                 asset_manager.prepare_evaluation_dataset(cfg)
+                cleanup_runtime("prepare-assets")
 
             elif step_kind == "training":
                 from .pipeline.train_runner import run_training
@@ -300,16 +320,24 @@ def run_single_job(cfg, config_source: str, bootstrap_meta: Optional[Dict[str, A
                 if logical_base_model_id and not training_result.get("base_model_id"):
                     training_result["base_model_id"] = logical_base_model_id
                 result["training"] = training_result
+                cleanup_runtime("training")
 
             elif step_kind == "evaluation":
                 from .pipeline.eval_runner import run_evaluation
 
                 logger.info("==> starting evaluation")
+                cleanup_runtime("pre-evaluation")
                 evaluation_result = run_evaluation(cfg, training_result, reporter=reporter)
                 result["evaluation"] = evaluation_result
+                cleanup_runtime("evaluation")
 
             elif step_kind == "publish_hf":
-                reporter.report_status("running", message="Publishing to HF", stage="publish", progress=90)
+                reporter.report_status(
+                    "running",
+                    message="Publishing to HF",
+                    stage="publish",
+                    progress=90,
+                )
                 hf_model_uploads = publisher.upload_to_huggingface(training_result)
                 if hf_model_uploads:
                     result["uploads"].update(hf_model_uploads)
@@ -324,8 +352,15 @@ def run_single_job(cfg, config_source: str, bootstrap_meta: Optional[Dict[str, A
                 if hf_metadata_uploads:
                     result["uploads"].update(hf_metadata_uploads)
 
+                cleanup_runtime("publish")
+
             elif step_kind == "upload_artifacts":
-                reporter.report_status("running", message="Uploading artifacts", stage="upload", progress=95)
+                reporter.report_status(
+                    "running",
+                    message="Uploading artifacts",
+                    stage="upload",
+                    progress=95,
+                )
                 extra_uploads, extra_upload_errors = uploader.upload_non_summary_artifacts(
                     log_file=str(log_file),
                     effective_config_path=str(effective_config_path),
@@ -336,6 +371,8 @@ def run_single_job(cfg, config_source: str, bootstrap_meta: Optional[Dict[str, A
                     result["uploads"].update(extra_uploads)
                 if extra_upload_errors:
                     result["upload_errors"].update(extra_upload_errors)
+
+                cleanup_runtime("upload")
 
         if has_steps:
             for step in pipeline.steps:
@@ -433,7 +470,7 @@ def run_single_job(cfg, config_source: str, bootstrap_meta: Optional[Dict[str, A
         except Exception:
             pass
         teardown_logging(handlers)
-        cleanup_runtime()
+        cleanup_runtime("job-finalize")
 
 
 def main():
@@ -455,8 +492,10 @@ def main():
             summary_root = Path(cfgs[0].outputs.base_dir)
             results = []
             for index, cfg in enumerate(cfgs, start=1):
+                cleanup_runtime(f"before-batch-job-{index}")
                 print(f"==> batch job {index}/{len(cfgs)}: {cfg.job_name}")
                 results.append(run_single_job(cfg, config_source, {}))
+                cleanup_runtime(f"after-batch-job-{index}")
     except Exception as exc:
         print(f"ERROR: failed to execute jobs: {exc}")
         sys.exit(1)

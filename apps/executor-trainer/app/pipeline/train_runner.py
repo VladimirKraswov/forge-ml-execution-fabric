@@ -1,10 +1,10 @@
 from __future__ import annotations
 
+import gc
 import inspect
 import json
 import logging
 import math
-import os
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -12,7 +12,6 @@ import unsloth  # noqa: F401
 from unsloth import FastLanguageModel
 
 import torch
-import os
 from datasets import load_dataset
 from transformers import TrainerCallback, TrainingArguments
 from trl import SFTTrainer
@@ -65,6 +64,32 @@ def safe_float(value: Any) -> Optional[float]:
     except Exception:
         pass
     return None
+
+
+def _cleanup_runtime(stage: str) -> None:
+    logger.info("==> cleaning runtime after %s", stage)
+
+    try:
+        gc.collect()
+    except Exception:
+        pass
+
+    try:
+        if torch.cuda.is_available():
+            try:
+                torch.cuda.synchronize()
+            except Exception:
+                pass
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+            try:
+                torch.cuda.ipc_collect()
+            except Exception:
+                pass
+    except Exception:
+        pass
 
 
 def build_text_from_messages(messages: list[dict], tokenizer) -> str:
@@ -195,7 +220,6 @@ def _build_training_args(cfg: JobConfig, checkpoint_dir: str, has_validation: bo
 
     sig = inspect.signature(TrainingArguments.__init__)
     supported = set(sig.parameters.keys())
-
     filtered_kwargs = {k: v for k, v in common_kwargs.items() if k in supported}
 
     if "report_to" in supported:
@@ -204,7 +228,6 @@ def _build_training_args(cfg: JobConfig, checkpoint_dir: str, has_validation: bo
     if has_validation:
         if "eval_steps" in supported:
             filtered_kwargs["eval_steps"] = cfg.training.eval_steps
-
         if "eval_strategy" in supported:
             filtered_kwargs["eval_strategy"] = "steps"
         elif "evaluation_strategy" in supported:
@@ -261,6 +284,11 @@ def _build_sft_trainer(
 def run_training(cfg: JobConfig, reporter: Optional[Reporter] = None) -> dict:
     ensure_dirs(cfg)
 
+    model = None
+    tokenizer = None
+    dataset = None
+    trainer = None
+
     model_name, load_in_4bit, logical_base_model_id = resolve_model_args(cfg)
 
     logger.info("==> loading model: %s", model_name)
@@ -268,210 +296,228 @@ def run_training(cfg: JobConfig, reporter: Optional[Reporter] = None) -> dict:
         logger.info("==> logical base model id: %s", logical_base_model_id)
     logger.info("==> method: %s", cfg.training.method)
 
-    if reporter:
-        reporter.report_status(
-            "running",
-            stage="load_model",
-            progress=5,
-            message="loading base model",
-            extra={
-                "model_name": model_name,
-                "logical_base_model_id": logical_base_model_id,
-                "load_in_4bit": load_in_4bit,
-                "dtype": cfg.model.dtype,
-            },
-        )
-
-    model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name=model_name,
-        max_seq_length=cfg.training.max_seq_length or cfg.model.max_seq_length,
-        dtype=torch.bfloat16 if cfg.training.bf16 else None,
-        load_in_4bit=load_in_4bit,
-        local_files_only=(cfg.model.source == "local"),
-        trust_remote_code=cfg.model.trust_remote_code,
-        device_map="auto",
-    )
-
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    if getattr(tokenizer, "padding_side", None) != "right":
-        tokenizer.padding_side = "right"
-
-    model = FastLanguageModel.get_peft_model(
-        model,
-        r=cfg.lora.r,
-        target_modules=cfg.lora.target_modules,
-        lora_alpha=cfg.lora.lora_alpha,
-        lora_dropout=cfg.lora.lora_dropout,
-        bias=cfg.lora.bias,
-        use_gradient_checkpointing=cfg.lora.use_gradient_checkpointing,
-        random_state=cfg.lora.random_state,
-    )
-
-    if not cfg.dataset.train_path:
-        raise ValueError("dataset.train_path is required for training")
-
-    if reporter:
-        reporter.report_status(
-            "running",
-            stage="load_dataset",
-            progress=15,
-            message="loading dataset",
-        )
-
-    data_files = {"train": cfg.dataset.train_path}
-    if cfg.dataset.val_path:
-        data_files["validation"] = cfg.dataset.val_path
-
-    dataset = load_dataset("json", data_files=data_files)
-
-    dataset = dataset.map(
-        lambda example: format_example(example, cfg, tokenizer),
-        desc="Formatting dataset",
-    )
-    dataset = dataset.filter(
-        lambda row: bool(str(row.get("text", "")).strip()),
-        desc="Filtering empty rows",
-    )
-
-    if len(dataset["train"]) == 0:
-        raise ValueError("Train dataset is empty after formatting/filtering")
-
-    checkpoint_dir = str(Path(cfg.outputs.checkpoints_dir) / cfg.job_name)
-    Path(checkpoint_dir).mkdir(parents=True, exist_ok=True)
-
-    training_args = _build_training_args(
-        cfg=cfg,
-        checkpoint_dir=checkpoint_dir,
-        has_validation="validation" in dataset,
-    )
-
-    trainer = _build_sft_trainer(
-        cfg=cfg,
-        model=model,
-        tokenizer=tokenizer,
-        train_dataset=dataset["train"],
-        eval_dataset=dataset["validation"] if "validation" in dataset else None,
-        training_args=training_args,
-    )
-
-    trainer.add_callback(TrainingProgressCallback(reporter))
-
-    logger.info("==> training started")
-    train_result = trainer.train()
-    logger.info("==> training finished")
-
-    lora_dir = Path(cfg.outputs.lora_dir) / cfg.job_name
-    merged_dir = Path(cfg.outputs.merged_dir) / cfg.job_name
-    metrics_path = Path(cfg.outputs.metrics_dir) / f"{cfg.job_name}.train_metrics.json"
-    history_path = Path(cfg.outputs.metrics_dir) / f"{cfg.job_name}.train_history.json"
-    train_summary_path = Path(cfg.outputs.metrics_dir) / f"{cfg.job_name}.train_summary.json"
-
-    lora_dir.mkdir(parents=True, exist_ok=True)
-    merged_dir.mkdir(parents=True, exist_ok=True)
-
-    if reporter:
-        reporter.report_status(
-            "running",
-            stage="save_lora",
-            progress=92,
-            message="saving lora adapters",
-            extra={"path": str(lora_dir)},
-        )
-
-    logger.info("==> saving lora adapters to %s", lora_dir)
-    model.save_pretrained(str(lora_dir))
-    tokenizer.save_pretrained(str(lora_dir))
-
-    merged_saved = False
-    if cfg.postprocess.merge_lora and cfg.postprocess.save_merged_16bit:
+    try:
         if reporter:
             reporter.report_status(
                 "running",
-                stage="merge_lora",
-                progress=96,
-                message="saving merged model",
-                extra={"path": str(merged_dir)},
+                stage="load_model",
+                progress=5,
+                message="loading base model",
+                extra={
+                    "model_name": model_name,
+                    "logical_base_model_id": logical_base_model_id,
+                    "load_in_4bit": load_in_4bit,
+                    "dtype": cfg.model.dtype,
+                },
             )
 
-        logger.info("==> saving merged model to %s", merged_dir)
-        logger.info("==> merged 16-bit save may take several minutes for 7B model")
-        model.save_pretrained_merged(
-            save_directory=str(merged_dir),
+        model, tokenizer = FastLanguageModel.from_pretrained(
+            model_name=model_name,
+            max_seq_length=cfg.training.max_seq_length or cfg.model.max_seq_length,
+            dtype=torch.bfloat16 if cfg.training.bf16 else None,
+            load_in_4bit=load_in_4bit,
+            local_files_only=(cfg.model.source == "local"),
+            trust_remote_code=cfg.model.trust_remote_code,
+            device_map="auto",
+        )
+
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        if getattr(tokenizer, "padding_side", None) != "right":
+            tokenizer.padding_side = "right"
+
+        model = FastLanguageModel.get_peft_model(
+            model,
+            r=cfg.lora.r,
+            target_modules=cfg.lora.target_modules,
+            lora_alpha=cfg.lora.lora_alpha,
+            lora_dropout=cfg.lora.lora_dropout,
+            bias=cfg.lora.bias,
+            use_gradient_checkpointing=cfg.lora.use_gradient_checkpointing,
+            random_state=cfg.lora.random_state,
+        )
+
+        if not cfg.dataset.train_path:
+            raise ValueError("dataset.train_path is required for training")
+
+        if reporter:
+            reporter.report_status(
+                "running",
+                stage="load_dataset",
+                progress=15,
+                message="loading dataset",
+            )
+
+        data_files = {"train": cfg.dataset.train_path}
+        if cfg.dataset.val_path:
+            data_files["validation"] = cfg.dataset.val_path
+
+        dataset = load_dataset("json", data_files=data_files)
+
+        dataset = dataset.map(
+            lambda example: format_example(example, cfg, tokenizer),
+            desc="Formatting dataset",
+        )
+        dataset = dataset.filter(
+            lambda row: bool(str(row.get("text", "")).strip()),
+            desc="Filtering empty rows",
+        )
+
+        if len(dataset["train"]) == 0:
+            raise ValueError("Train dataset is empty after formatting/filtering")
+
+        checkpoint_dir = str(Path(cfg.outputs.checkpoints_dir) / cfg.job_name)
+        Path(checkpoint_dir).mkdir(parents=True, exist_ok=True)
+
+        training_args = _build_training_args(
+            cfg=cfg,
+            checkpoint_dir=checkpoint_dir,
+            has_validation="validation" in dataset,
+        )
+
+        trainer = _build_sft_trainer(
+            cfg=cfg,
+            model=model,
             tokenizer=tokenizer,
-            save_method="merged_16bit",
-        )
-        logger.info("==> merged model saved")
-        merged_saved = True
-
-    metrics = dict(train_result.metrics)
-    history = trainer.state.log_history
-
-    final_loss = None
-    for entry in reversed(history):
-        if "loss" in entry:
-            final_loss = entry["loss"]
-            break
-
-    train_summary = {
-        "job_name": cfg.job_name,
-        "train_rows": len(dataset["train"]),
-        "validation_rows": len(dataset["validation"]) if "validation" in dataset else 0,
-        "method": cfg.training.method,
-        "base_model": model_name,
-        "base_model_id": logical_base_model_id,
-        "base_model_name_or_path": logical_base_model_id,
-        "load_in_4bit": load_in_4bit,
-        "bf16": cfg.training.bf16,
-        "merged_saved": merged_saved,
-        "train_runtime": metrics.get("train_runtime"),
-        "train_samples_per_second": metrics.get("train_samples_per_second"),
-        "train_steps_per_second": metrics.get("train_steps_per_second"),
-        "train_loss": metrics.get("train_loss"),
-        "final_loss": final_loss,
-    }
-
-    with metrics_path.open("w", encoding="utf-8") as f:
-        json.dump(metrics, f, indent=2, ensure_ascii=False)
-
-    with history_path.open("w", encoding="utf-8") as f:
-        json.dump(history, f, indent=2, ensure_ascii=False)
-
-    with train_summary_path.open("w", encoding="utf-8") as f:
-        json.dump(train_summary, f, indent=2, ensure_ascii=False)
-
-    logger.info("==> training artifacts saved")
-
-    if reporter:
-        reporter.report_status(
-            "running",
-            stage="train_completed",
-            progress=100,
-            message="training stage completed",
-            extra=train_summary,
+            train_dataset=dataset["train"],
+            eval_dataset=dataset["validation"] if "validation" in dataset else None,
+            training_args=training_args,
         )
 
-    try:
-        del trainer
-    except Exception:
-        pass
+        trainer.add_callback(TrainingProgressCallback(reporter))
 
-    try:
-        torch.cuda.empty_cache()
-    except Exception:
-        pass
+        logger.info("==> training started")
+        train_result = trainer.train()
+        logger.info("==> training finished")
 
-    return {
-        "status": "success",
-        "job_name": cfg.job_name,
-        "base_model": model_name,
-        "base_model_id": logical_base_model_id,
-        "base_model_name_or_path": logical_base_model_id,
-        "lora_dir": str(lora_dir),
-        "merged_dir": str(merged_dir) if merged_saved else None,
-        "checkpoint_dir": checkpoint_dir,
-        "metrics_path": str(metrics_path),
-        "history_path": str(history_path),
-        "train_summary_path": str(train_summary_path),
-        "summary": train_summary,
-    }
+        lora_dir = Path(cfg.outputs.lora_dir) / cfg.job_name
+        merged_dir = Path(cfg.outputs.merged_dir) / cfg.job_name
+        metrics_path = Path(cfg.outputs.metrics_dir) / f"{cfg.job_name}.train_metrics.json"
+        history_path = Path(cfg.outputs.metrics_dir) / f"{cfg.job_name}.train_history.json"
+        train_summary_path = Path(cfg.outputs.metrics_dir) / f"{cfg.job_name}.train_summary.json"
+
+        lora_dir.mkdir(parents=True, exist_ok=True)
+        merged_dir.mkdir(parents=True, exist_ok=True)
+
+        if reporter:
+            reporter.report_status(
+                "running",
+                stage="save_lora",
+                progress=92,
+                message="saving lora adapters",
+                extra={"path": str(lora_dir)},
+            )
+
+        logger.info("==> saving lora adapters to %s", lora_dir)
+        model.save_pretrained(str(lora_dir))
+        tokenizer.save_pretrained(str(lora_dir))
+
+        merged_saved = False
+        if cfg.postprocess.merge_lora and cfg.postprocess.save_merged_16bit:
+            if reporter:
+                reporter.report_status(
+                    "running",
+                    stage="merge_lora",
+                    progress=96,
+                    message="saving merged model",
+                    extra={"path": str(merged_dir)},
+                )
+
+            logger.info("==> saving merged model to %s", merged_dir)
+            logger.info("==> merged 16-bit save may take several minutes for 7B model")
+            model.save_pretrained_merged(
+                save_directory=str(merged_dir),
+                tokenizer=tokenizer,
+                save_method="merged_16bit",
+            )
+            logger.info("==> merged model saved")
+            merged_saved = True
+
+        metrics = dict(train_result.metrics)
+        history = trainer.state.log_history
+
+        final_loss = None
+        for entry in reversed(history):
+            if "loss" in entry:
+                final_loss = entry["loss"]
+                break
+
+        train_summary = {
+            "job_name": cfg.job_name,
+            "train_rows": len(dataset["train"]),
+            "validation_rows": len(dataset["validation"]) if "validation" in dataset else 0,
+            "method": cfg.training.method,
+            "base_model": model_name,
+            "base_model_id": logical_base_model_id,
+            "base_model_name_or_path": logical_base_model_id,
+            "load_in_4bit": load_in_4bit,
+            "bf16": cfg.training.bf16,
+            "merged_saved": merged_saved,
+            "train_runtime": metrics.get("train_runtime"),
+            "train_samples_per_second": metrics.get("train_samples_per_second"),
+            "train_steps_per_second": metrics.get("train_steps_per_second"),
+            "train_loss": metrics.get("train_loss"),
+            "final_loss": final_loss,
+        }
+
+        with metrics_path.open("w", encoding="utf-8") as f:
+            json.dump(metrics, f, indent=2, ensure_ascii=False)
+
+        with history_path.open("w", encoding="utf-8") as f:
+            json.dump(history, f, indent=2, ensure_ascii=False)
+
+        with train_summary_path.open("w", encoding="utf-8") as f:
+            json.dump(train_summary, f, indent=2, ensure_ascii=False)
+
+        logger.info("==> training artifacts saved")
+
+        if reporter:
+            reporter.report_status(
+                "running",
+                stage="train_completed",
+                progress=100,
+                message="training stage completed",
+                extra=train_summary,
+            )
+
+        return {
+            "status": "success",
+            "job_name": cfg.job_name,
+            "base_model": model_name,
+            "base_model_id": logical_base_model_id,
+            "base_model_name_or_path": logical_base_model_id,
+            "lora_dir": str(lora_dir),
+            "merged_dir": str(merged_dir) if merged_saved else None,
+            "checkpoint_dir": checkpoint_dir,
+            "metrics_path": str(metrics_path),
+            "history_path": str(history_path),
+            "train_summary_path": str(train_summary_path),
+            "summary": train_summary,
+        }
+
+    finally:
+        try:
+            if trainer is not None:
+                del trainer
+        except Exception:
+            pass
+
+        try:
+            if dataset is not None:
+                del dataset
+        except Exception:
+            pass
+
+        try:
+            if model is not None:
+                del model
+        except Exception:
+            pass
+
+        try:
+            if tokenizer is not None:
+                del tokenizer
+        except Exception:
+            pass
+
+        _cleanup_runtime("training")
