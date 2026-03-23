@@ -1,0 +1,3 @@
+{"id": "1", "question": "Привет", "candidate_answer": "你好", "reference_score": 5, "max_score": 5, "hash_tags": ["greeting"]}
+{"id": "2", "question": "Как дела?", "candidate_answer": "你好吗", "reference_score": 4, "max_score": 5, "hash_tags": ["greeting"]}
+{"id": "3", "question": "Спасибо", "candidate_answer": "谢谢", "reference_score": 5, "max_score": 5, "hash_tags": ["courtesy"]}
