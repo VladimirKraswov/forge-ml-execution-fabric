@@ -42,7 +42,6 @@ def wheel_name_from_filename(path: str):
     base = os.path.basename(path)
     if not base.endswith(".whl"):
         return None
-    # wheel format: {dist}-{version}(-{build})?-{py}-{abi}-{platform}.whl
     parts = base[:-4].split("-")
     if len(parts) < 5:
         return None
@@ -61,7 +60,6 @@ def parse_req_name(line: str):
     if line.startswith(".") or line.startswith("/"):
         return None
 
-    # remove env markers
     line = line.split(";", 1)[0].strip()
 
     for sep in ["==", ">=", "<=", "~=", "!=", ">", "<"]:
@@ -108,6 +106,17 @@ print(json.dumps(matched, ensure_ascii=False))
 PY
 }
 
+run_pip_install() {
+  if [ "${MODE}" = "--requirements" ]; then
+    "${PYTHON_BIN}" -m pip install "$@" -r "${TARGET}" --break-system-packages
+  elif [ "${MODE}" = "--package" ]; then
+    "${PYTHON_BIN}" -m pip install "$@" "${TARGET}" --break-system-packages
+  else
+    echo "ERROR: unsupported mode ${MODE}"
+    exit 1
+  fi
+}
+
 LOCAL_WHEELS_JSON="$(find_local_wheels)"
 LOCAL_WHEELS=$("${PYTHON_BIN}" - <<'PY' "$LOCAL_WHEELS_JSON"
 import json
@@ -119,12 +128,13 @@ PY
 )
 
 if [ -n "${LOCAL_WHEELS}" ]; then
-  echo "==> installing matching local wheels first"
+  echo "==> preinstalling matching local wheels without deps"
   while IFS= read -r wheel_path; do
     [ -z "${wheel_path}" ] && continue
     echo "==> local wheel: ${wheel_path}"
     "${PYTHON_BIN}" -m pip install \
       --no-index \
+      --no-deps \
       "${wheel_path}" \
       --break-system-packages
   done <<< "${LOCAL_WHEELS}"
@@ -132,21 +142,16 @@ else
   echo "==> no matching top-level local wheels found"
 fi
 
-if [ "${MODE}" = "--requirements" ]; then
-  echo "==> installing requirements with local-wheel preference"
-  "${PYTHON_BIN}" -m pip install \
-    --prefer-binary \
-    --find-links "${WHEEL_DIR}" \
-    -r "${TARGET}" \
-    --break-system-packages
-elif [ "${MODE}" = "--package" ]; then
-  echo "==> installing package ${TARGET} with local-wheel preference"
-  "${PYTHON_BIN}" -m pip install \
-    --prefer-binary \
-    --find-links "${WHEEL_DIR}" \
-    "${TARGET}" \
-    --break-system-packages
-else
-  echo "ERROR: unsupported mode ${MODE}"
-  exit 1
+echo "==> trying offline install first"
+set +e
+run_pip_install --prefer-binary --no-index --find-links "${WHEEL_DIR}"
+OFFLINE_EXIT=$?
+set -e
+
+if [ "${OFFLINE_EXIT}" -eq 0 ]; then
+  echo "==> offline install succeeded"
+  exit 0
 fi
+
+echo "==> offline install incomplete, falling back to online with local wheel preference"
+run_pip_install --prefer-binary --find-links "${WHEEL_DIR}"
