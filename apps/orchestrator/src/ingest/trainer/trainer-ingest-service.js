@@ -220,7 +220,7 @@ async function handleTrainerStatus(body) {
   const { job, attempt, snapshot } = await getTrainerContext(jobId);
   const stepKey = stageToStepKey(body.stage);
   const reportedStatus = normalizeReportedStatus(body.status, job.status || 'running');
-  const uniqueKey = JSON.stringify({
+  const uniqueKey = body.sequence_no != null ? `seq:${body.sequence_no}` : JSON.stringify({
     status: reportedStatus,
     stage: body.stage || null,
     progress: body.progress ?? null,
@@ -303,7 +303,7 @@ async function handleTrainerProgress(body) {
 
   const { job, attempt, snapshot } = await getTrainerContext(jobId);
   const stepKey = stageToStepKey(body.stage);
-  const uniqueKey = JSON.stringify({
+  const uniqueKey = body.sequence_no != null ? `seq:${body.sequence_no}` : JSON.stringify({
     stage: body.stage || null,
     progress: body.progress ?? null,
     message: body.message || null,
@@ -457,6 +457,8 @@ async function handleTrainerLogs(body) {
   return { ok: true };
 }
 
+const { requestHfSync } = require('../../services/job-service');
+
 async function handleTrainerFinal(body) {
   const jobId = String(body.job_id || '').trim();
   if (!jobId) throw new Error('job_id is required');
@@ -465,7 +467,7 @@ async function handleTrainerFinal(body) {
   const resultPayload = deepClone(body.result || {});
   const reportedStatus = normalizeReportedStatus(body.status || resultPayload.status, 'finished');
   const outcome = reportedStatus === 'failed' ? 'failed' : (reportedStatus === 'cancelled' ? 'cancelled' : 'finished');
-  const uniqueKey = JSON.stringify({
+  const uniqueKey = body.sequence_no != null ? `seq:${body.sequence_no}` : JSON.stringify({
     status: outcome,
     finishedAt: resultPayload.finished_at || body.timestamp || null,
     error: resultPayload.error || null,
@@ -559,6 +561,18 @@ async function handleTrainerFinal(body) {
       updated_at: nowIso(),
     });
   });
+
+  const externalRefs = resultPayload.externalRefs || [];
+  for (const ref of externalRefs) {
+    if (ref.backend === 'huggingface') {
+      await requestHfSync(jobId, {
+        repoId: ref.repoId,
+        repoType: ref.repoType || 'model',
+        requestedRevision: ref.revision || 'main',
+        reason: 'final_callback',
+      });
+    }
+  }
 
   return { ok: true };
 }

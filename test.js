@@ -1119,11 +1119,19 @@ async function main() {
     }
 
     info(`Launching trainer container using: ${launchSpec.dockerRun}`);
-    const launch = await launchJob(backend.externalBaseUrl, jwt, jobId);
-    if (!launch?.launched) throw new Error('Launch endpoint did not confirm launch');
-    ok(`Trainer container launched: ${launch.containerId || launch.containerName}`);
+    const launchResult = await launchJob(backend.externalBaseUrl, jwt, jobId);
 
-    const launchedContainerName = launch.containerName || launch.containerId || '';
+    // В новой архитектуре оркестратор НЕ запускает контейнер сам.
+    // Запуск должен выполнить внешний лаунчер. Здесь мы делаем это вручную через docker run.
+    info(`Executing docker run from launcher (test script)`);
+    const dockerResult = await runCommand('docker', launchResult.launchArgs, {
+      verbose: args.verbose,
+      label: 'external-launcher',
+    });
+    const containerId = dockerResult.stdout.split(/\s+/)[0];
+    ok(`Trainer container launched by external launcher: ${containerId}`);
+
+    const launchedContainerName = launchResult.containerName || containerId;
     if (launchedContainerName) info(`Launched container: ${launchedContainerName}`);
 
     const terminalJob = await waitForJobTerminal(

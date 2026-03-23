@@ -130,6 +130,25 @@ def main():
 
     started_at = utc_now_iso()
 
+    # Heartbeat thread
+    import threading
+    import time
+    def heartbeat_loop():
+        while True:
+            try:
+                reporter.report_status(
+                    "running",
+                    message="Heartbeat",
+                    stage="heartbeat",
+                    extra={"heartbeat": True}
+                )
+            except Exception:
+                pass
+            time.sleep(30)
+
+    hb_thread = threading.Thread(target=heartbeat_loop, daemon=True)
+    hb_thread.start()
+
     try:
         reporter.report_status(
             "started",
@@ -154,69 +173,26 @@ def main():
         publisher.ensure_hf_ready()
 
         pipeline = cfg.pipeline
+        has_steps = pipeline and pipeline.steps
 
-        if not pipeline or pipeline.prepare_assets.enabled:
-            logger.info("==> preparing assets")
-            reporter.report_status(
-                "running",
-                message="Preparing datasets and remote assets",
-                stage="prepare_assets",
-                progress=5,
-            )
-            asset_manager.prepare_dataset(cfg)
-            asset_manager.prepare_evaluation_dataset(cfg)
+        if has_steps:
+            logger.info("==> executing pipeline steps")
         else:
-            logger.info("==> skipping assets preparation")
-
-        # Важно: Unsloth должен импортироваться до transformers/peft.
-        from .pipeline.train_runner import run_training
+            logger.warning("==> pipeline.steps missing, falling back to legacy sequence")
 
         training_result = {}
-        if not pipeline or pipeline.training.enabled:
-            logger.info("==> starting training")
-            training_result = run_training(cfg, reporter=reporter)
-
-            logical_base_model_id = cfg.model.logical_base_model_id
-            if logical_base_model_id and not training_result.get("base_model_id"):
-                training_result["base_model_id"] = logical_base_model_id
-                training_result["base_model_name_or_path"] = logical_base_model_id
-                summary = training_result.get("summary")
-                if isinstance(summary, dict):
-                    summary.setdefault("base_model_id", logical_base_model_id)
-                    summary.setdefault("base_model_name_or_path", logical_base_model_id)
-
-            logger.info("==> training finished")
-        else:
-            logger.info("==> skipping training stage")
-            training_result = {
-                "status": "skipped",
-                "message": "Training stage disabled in pipeline",
-            }
-
-        if cfg.postprocess.run_awq_quantization:
-            raise NotImplementedError("AWQ quantization stage is not implemented in this service yet")
-
         evaluation_result = None
-        should_eval = pipeline.evaluation.enabled if pipeline else cfg.evaluation.enabled
-
-        if should_eval:
-            from .pipeline.eval_runner import run_evaluation
-
-            logger.info("==> starting evaluation")
-            evaluation_result = run_evaluation(cfg, training_result, reporter=reporter)
-            logger.info("==> evaluation finished")
-        else:
-            logger.info("==> skipping evaluation stage")
+        external_refs = []
 
         result: Dict[str, Any] = {
             "status": "success",
             "job_id": cfg.job_id or cfg.job_name,
             "job_name": cfg.job_name,
             "started_at": started_at,
-            "finished_at": utc_now_iso(),
+            "finished_at": None,
             "config_source": config_source,
-            "training": training_result,
-            "evaluation": evaluation_result,
+            "training": {},
+            "evaluation": None,
             "artifacts": {
                 "log_file": str(log_file),
                 "effective_config_path": str(effective_config_path),
@@ -224,42 +200,64 @@ def main():
             },
             "uploads": {},
             "upload_errors": {},
+            "externalRefs": external_refs,
         }
 
-        should_upload = pipeline.upload.enabled if pipeline else cfg.upload.enabled
+        # Legacy sequence logic or Step-based execution
+        # For simplicity in v1, we process steps in order from cfg.pipeline.steps
+        # while maintaining compatibility with the runners.
 
-        if should_upload:
-            if cfg.upload.target == "url" and cfg.upload.upload_url:
-                logger.info("==> legacy full archive upload")
-                try:
-                    archive_path = Path(cfg.outputs.base_dir) / f"{cfg.job_name}.tar.gz"
-                    archiver.make_archive(cfg.outputs.base_dir, str(archive_path))
-                    archiver.upload_archive(
-                        str(archive_path),
-                        cfg.upload.upload_url,
-                        headers=uploader._headers(),
-                        form_data={
-                            "job_id": cfg.job_id or cfg.job_name,
-                            "job_name": cfg.job_name,
-                            "artifact_type": "full_archive",
-                        },
-                        timeout_sec=cfg.upload.timeout_sec,
-                    )
-                    result["uploads"]["legacy_full_archive"] = {
-                        "url": cfg.upload.upload_url,
-                        "archive_path": str(archive_path),
-                    }
-                except Exception as exc:
-                    logger.exception("legacy full archive upload failed")
-                    result["upload_errors"]["legacy_full_archive"] = str(exc)
+        def run_step(step_key, step_kind):
+            nonlocal training_result, evaluation_result
 
-            if cfg.upload.target == "url":
-                reporter.report_status(
-                    "running",
-                    message="Uploading URL artifacts",
-                    stage="upload_artifacts",
-                    progress=97,
+            if step_kind == "prepare_assets":
+                logger.info("==> preparing assets")
+                reporter.report_status("running", message="Preparing assets", stage="prepare_assets", progress=5)
+                asset_manager.prepare_dataset(cfg)
+                asset_manager.prepare_evaluation_dataset(cfg)
+
+            elif step_kind == "training":
+                from .pipeline.train_runner import run_training
+                logger.info("==> starting training")
+                training_result = run_training(cfg, reporter=reporter)
+                logical_base_model_id = cfg.model.logical_base_model_id
+                if logical_base_model_id and not training_result.get("base_model_id"):
+                    training_result["base_model_id"] = logical_base_model_id
+                result["training"] = training_result
+
+            elif step_kind == "evaluation":
+                from .pipeline.eval_runner import run_evaluation
+                logger.info("==> starting evaluation")
+                evaluation_result = run_evaluation(cfg, training_result, reporter=reporter)
+                result["evaluation"] = evaluation_result
+
+            elif step_kind == "publish_hf":
+                reporter.report_status("running", message="Publishing to HF", stage="publish", progress=90)
+                hf_model_uploads = publisher.upload_to_huggingface(training_result)
+                if hf_model_uploads:
+                    result["uploads"].update(hf_model_uploads)
+                    # Gather external refs from publish
+                    if hf_model_uploads.get("merged_model"):
+                        plan = hf_model_uploads["merged_model"].get("plan", {})
+                        external_refs.append({
+                            "backend": "huggingface",
+                            "repoId": plan.get("merged_repo"),
+                            "repoType": "model",
+                            "revision": plan.get("revision") or "main",
+                        })
+
+                hf_metadata_uploads = publisher.upload_hf_metadata(
+                    log_file=str(log_file),
+                    effective_config_path=str(effective_config_path),
+                    result_path=str(result_path),
+                    training_result=training_result,
+                    eval_result=evaluation_result,
                 )
+                if hf_metadata_uploads:
+                    result["uploads"].update(hf_metadata_uploads)
+
+            elif step_kind == "upload_artifacts":
+                reporter.report_status("running", message="Uploading artifacts", stage="upload", progress=95)
                 extra_uploads, extra_upload_errors = uploader.upload_non_summary_artifacts(
                     log_file=str(log_file),
                     effective_config_path=str(effective_config_path),
@@ -270,39 +268,33 @@ def main():
                     result["uploads"].update(extra_uploads)
                 if extra_upload_errors:
                     result["upload_errors"].update(extra_upload_errors)
+
+        if has_steps:
+            for step in pipeline.steps:
+                if step.enabled:
+                    run_step(step.key, step.kind)
+                else:
+                    logger.info("==> step %s disabled, skipping", step.key)
         else:
-            logger.info("==> skipping upload stage")
+            # Fallback legacy sequence
+            if not pipeline or pipeline.prepare_assets.enabled:
+                run_step("prepare_assets", "prepare_assets")
 
-        write_json(result_path, result)
+            if not pipeline or pipeline.training.enabled:
+                run_step("training", "training")
 
-        should_publish = pipeline.publish.enabled if pipeline else cfg.huggingface.enabled
+            if (pipeline.evaluation.enabled if pipeline else cfg.evaluation.enabled):
+                run_step("evaluation", "evaluation")
 
-        if should_publish:
-            reporter.report_status(
-                "running",
-                message="Publishing artifacts to Hugging Face",
-                stage="publish_artifacts",
-                progress=98,
-            )
+            if (pipeline.publish.enabled if pipeline else cfg.huggingface.enabled):
+                run_step("publish", "publish_hf")
 
-            hf_model_uploads = publisher.upload_to_huggingface(training_result)
-            if hf_model_uploads:
-                result["uploads"].update(hf_model_uploads)
-                write_json(result_path, result)
+            if (pipeline.upload.enabled if pipeline else cfg.upload.enabled):
+                run_step("upload", "upload_artifacts")
 
-            hf_metadata_uploads = publisher.upload_hf_metadata(
-                log_file=str(log_file),
-                effective_config_path=str(effective_config_path),
-                result_path=str(result_path),
-                training_result=training_result,
-                eval_result=evaluation_result,
-            )
-            if hf_metadata_uploads:
-                result["uploads"].update(hf_metadata_uploads)
-                write_json(result_path, result)
-        else:
-            logger.info("==> skipping publish stage")
+        result["finished_at"] = utc_now_iso()
 
+        should_upload = pipeline.upload.enabled if pipeline else cfg.upload.enabled
         if should_upload and cfg.upload.target == "url" and cfg.upload.url_targets.summary_url:
             try:
                 summary_upload = uploader.upload_summary(str(result_path))

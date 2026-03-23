@@ -301,6 +301,15 @@ class UploadStage(PipelineStage, UploadConfig):
     pass
 
 
+class PipelineStep(AppBaseModel):
+    key: str
+    displayName: str
+    kind: str
+    enabled: bool = True
+    dependsOn: List[str] = Field(default_factory=list)
+    weight: Optional[float] = None
+
+
 class PipelineConfig(AppBaseModel):
     prepare_assets: PipelineStage = Field(default_factory=PipelineStage)
     training: TrainingStage = Field(default_factory=TrainingStage)
@@ -308,6 +317,7 @@ class PipelineConfig(AppBaseModel):
     evaluation: EvaluationStage = Field(default_factory=EvaluationStage)
     publish: PublishStage = Field(default_factory=PublishStage)
     upload: UploadStage = Field(default_factory=UploadStage)
+    steps: List[PipelineStep] = Field(default_factory=list)
 
 
 class JobConfig(AppBaseModel):

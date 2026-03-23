@@ -27,17 +27,11 @@ RUN python3 -m venv /opt/venv
 
 WORKDIR /trainer
 
-# Копируем все предварительно скачанные wheel-файлы
-COPY packages/pip /wheels/pip
+# Устанавливаем зависимости из requirements.txt
 COPY requirements.txt /trainer/requirements.txt
 
 RUN pip install -U pip setuptools wheel
-
-# Устанавливаем только те пакеты, которые указаны в requirements.txt,
-# используя локальные колёса (--find-links) и без обращения в интернет (--no-index).
-# Pip сам разрешит и установит все необходимые зависимости (включая транзитивные,
-# такие как urllib3, idna и т.д.) из папки /wheels/pip.
-RUN pip install -r /trainer/requirements.txt --no-index --find-links /wheels/pip --break-system-packages
+RUN pip install -r /trainer/requirements.txt --break-system-packages
 
 COPY app /trainer/app
 COPY docker/entrypoint.sh /trainer/entrypoint.sh

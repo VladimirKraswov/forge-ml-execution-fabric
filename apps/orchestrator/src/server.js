@@ -10,6 +10,9 @@ const { seedDefaultRuntimeProfiles } = require('./services/runtime-profile-servi
 const { ensureArtifactRoots } = require('./infrastructure/storage/artifact-storage-service');
 const { authRequired } = require('./api/middleware/auth');
 
+const { startLostJobDetector } = require('./infrastructure/workers/lost-job-detector');
+const { startHfReconciler } = require('./infrastructure/workers/hf-reconciler');
+
 const healthRoute = require('./api/routes/health');
 const authRoute = require('./api/routes/auth');
 const runtimeProfilesRoute = require('./api/routes/runtime-profiles');
@@ -27,6 +30,9 @@ async function main() {
   await initDb();
   await seedAdminUser();
   await seedDefaultRuntimeProfiles();
+
+  startLostJobDetector();
+  startHfReconciler();
 
   const app = express();
   app.set('trust proxy', true);

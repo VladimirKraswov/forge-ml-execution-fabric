@@ -52,8 +52,22 @@ function mergeObjects(baseValue, overrideValue) {
   };
 }
 
+function stripSecrets(obj) {
+  if (!obj || typeof obj !== 'object') return obj;
+  if (Array.isArray(obj)) return obj.map(stripSecrets);
+
+  const result = {};
+  for (const [key, value] of Object.entries(obj)) {
+    if (key === 'bearer_token' || key === 'HF_TOKEN' || key === 'hf_token' || key === 'callback_auth_token') {
+      continue;
+    }
+    result[key] = stripSecrets(value);
+  }
+  return result;
+}
+
 function normalizePipelineConfig(configInput) {
-  const config = deepClone(configInput);
+  const config = stripSecrets(deepClone(configInput));
 
   const training = asObject(config.training, {});
   const postprocess = asObject(config.postprocess, {});
@@ -276,7 +290,7 @@ function normalizeExecutor(payloadExecutor, runtimeProfile, jobId) {
   ];
 
   return {
-    image: String(input.image || runtimeProfile.runtimeImage || CONFIG.defaultRuntimeImage).trim(),
+    image: String(runtimeProfile.runtimeImage || CONFIG.defaultRuntimeImage).trim(),
     gpus: input.gpus == null ? (runtimeProfile.launchHints?.gpus ?? 'all') : input.gpus,
     shmSize: String(input.shmSize || runtimeProfile.launchHints?.shmSize || '16g').trim(),
     mounts: mergedMounts,
@@ -347,6 +361,11 @@ async function createTrainerJob(payload, actor) {
     throw new Error('config object is required');
   }
 
+  const configVersion = String(inputConfig.config_version || '1.0');
+  if (!ensureArray(runtimeProfile.supportedConfigVersions).includes(configVersion)) {
+    throw new Error(`Config version ${configVersion} not supported by profile ${runtimeProfile.profileKey}`);
+  }
+
   const jobId = normalizeJobId(payload.jobId);
   const existing = await db('jobs').where({ id: jobId }).first();
   if (existing) {
@@ -362,14 +381,14 @@ async function createTrainerJob(payload, actor) {
   const attemptId = newId('att');
   const snapshotId = newId('cfg');
 
-  const snapshotDocument = buildSnapshotDocument({
+  const snapshotDocument = stripSecrets(buildSnapshotDocument({
     jobId,
     jobName,
     runtimeProfile,
     trainerConfigBase,
     executor,
     steps,
-  });
+  }));
   const digest = computeDigest(snapshotDocument);
 
   await db.transaction(async (trx) => {
@@ -739,110 +758,58 @@ function buildDockerArgs(spec, launchBody = {}) {
 async function launchTrainerJob(jobId, body, actor, req) {
   const spec = await buildTrainerLaunchSpec(jobId, buildPublicBaseUrl(req, CONFIG.publicBaseUrl));
   const executor = asObject(spec.executor, {});
-  await db('jobs').where({ id: jobId }).first();
 
   await require('fs/promises').mkdir(executor.outputHostDir, { recursive: true });
 
   const { args, envKeys } = buildDockerArgs(spec, body || {});
   const now = nowIso();
 
-  try {
-    const result = await dockerRunPromise(CONFIG.runtimeDockerBin, args);
-    const containerId = String(result.stdout || '').split(/\s+/).filter(Boolean)[0] || null;
+  const attemptRow = await db('job_attempts').where({ id: spec.attemptId }).first();
+  const runtimeInfo = parseJson(attemptRow?.runtime_info_json, {});
 
-    const attemptRow = await db('job_attempts').where({ id: spec.attemptId }).first();
-    const runtimeInfo = parseJson(attemptRow?.runtime_info_json, {});
-
-    await db.transaction(async (trx) => {
-      await trx('job_attempts').where({ id: spec.attemptId }).update({
-        status: 'started',
-        stage: 'bootstrap',
-        started_at: attemptRow?.started_at || now,
-        last_seen_at: now,
-        runtime_info_json: toJson({
-          ...runtimeInfo,
-          containerId,
-          lastLaunch: {
-            launchedAt: now,
-            envKeys,
-            args,
-          },
-        }),
-        updated_at: now,
-      });
-
-      await trx('jobs').where({ id: jobId }).update({
-        status: 'started',
-        stage: 'bootstrap',
-        headline: 'Trainer container launched',
-        started_at: now,
-        updated_at: now,
-      });
-
-      await trx('job_events').insert({
-        id: newId('evt'),
-        job_id: jobId,
-        attempt_id: spec.attemptId,
-        step_key: 'bootstrap',
-        event_type: 'trainer.launch.started',
-        severity: 'info',
-        sequence_no: 0,
-        delivery_id: newId('delivery'),
-        event_time: now,
-        received_at: now,
-        payload_json: toJson({
-          containerId,
-          containerName: spec.containerName,
-          runtimeImage: spec.runtimeImage,
-          hostOutputDir: spec.hostOutputDir,
-        }),
-      });
+  await db.transaction(async (trx) => {
+    await trx('job_attempts').where({ id: spec.attemptId }).update({
+      runtime_info_json: toJson({
+        ...runtimeInfo,
+        requested_container_name: spec.containerName,
+        lastLaunchRequest: {
+          requestedAt: now,
+          envKeys,
+          args,
+        },
+      }),
+      updated_at: now,
     });
 
-    return {
-      launched: true,
-      jobId,
-      attemptId: spec.attemptId,
-      containerId,
-      containerName: spec.containerName,
-      jobConfigUrl: spec.jobConfigUrl,
-      hostOutputDir: spec.hostOutputDir,
-    };
-  } catch (error) {
-    await db.transaction(async (trx) => {
-      await trx('job_attempts').where({ id: spec.attemptId }).update({
-        status: 'failed',
-        stage: 'bootstrap',
-        failure_reason: String(error.message || error),
-        finished_at: now,
-        updated_at: now,
-      });
-
-      await trx('jobs').where({ id: jobId }).update({
-        status: 'failed',
-        stage: 'bootstrap',
-        headline: 'Trainer launch failed',
-        terminal_reason: String(error.message || error),
-        finished_at: now,
-        updated_at: now,
-      });
-
-      await trx('job_events').insert({
-        id: newId('evt'),
-        job_id: jobId,
-        attempt_id: spec.attemptId,
-        step_key: 'bootstrap',
-        event_type: 'trainer.launch.failed',
-        severity: 'error',
-        sequence_no: 0,
-        delivery_id: newId('delivery'),
-        event_time: now,
-        received_at: now,
-        payload_json: toJson({ error: String(error.message || error) }),
-      });
+    await trx('jobs').where({ id: jobId }).update({
+      headline: 'Trainer launch requested',
+      updated_at: now,
     });
-    throw error;
-  }
+
+    await trx('job_events').insert({
+      id: newId('evt'),
+      job_id: jobId,
+      attempt_id: spec.attemptId,
+      step_key: 'bootstrap',
+      event_type: 'trainer.launch.requested',
+      severity: 'info',
+      sequence_no: 0,
+      delivery_id: newId('delivery'),
+      event_time: now,
+      received_at: now,
+      payload_json: toJson({
+        containerName: spec.containerName,
+        runtimeImage: spec.runtimeImage,
+        hostOutputDir: spec.hostOutputDir,
+      }),
+    });
+  });
+
+  return {
+    ...spec,
+    launched: false,
+    launchArgs: args,
+  };
 }
 
 async function stopTrainerJob(jobId, actor) {
