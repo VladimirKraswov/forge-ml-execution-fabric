@@ -255,6 +255,7 @@ class EvaluationConfig(AppBaseModel):
     gpu_memory_utilization: float = 0.9
     max_num_seqs: Optional[int] = None
     max_num_batched_tokens: Optional[int] = None
+    max_model_len: Optional[int] = 1024
     enforce_eager: bool = False
 
     @model_validator(mode="after")

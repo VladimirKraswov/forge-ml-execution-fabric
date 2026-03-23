@@ -1,15 +1,11 @@
 from __future__ import annotations
 
-import copy
-import gc
 import json
 import logging
 import os
 import subprocess
 from pathlib import Path
-from typing import Any, Dict, List, Optional
-
-import torch
+from typing import Any, Dict, Optional
 
 from ..adapters.reporter import Reporter
 from ..bootstrap.schemas import JobConfig
@@ -21,32 +17,6 @@ VLLM_PYTHON_BIN = os.environ.get("VLLM_PYTHON_BIN", "/opt/vllm-venv/bin/python")
 
 def _worker_script_path() -> str:
     return str(Path(__file__).with_name("vllm_eval_worker.py"))
-
-
-def _cleanup_runtime(stage: str) -> None:
-    logger.info("==> cleaning runtime after %s", stage)
-
-    try:
-        gc.collect()
-    except Exception:
-        pass
-
-    try:
-        if torch.cuda.is_available():
-            try:
-                torch.cuda.synchronize()
-            except Exception:
-                pass
-            try:
-                torch.cuda.empty_cache()
-            except Exception:
-                pass
-            try:
-                torch.cuda.ipc_collect()
-            except Exception:
-                pass
-    except Exception:
-        pass
 
 
 def _build_worker_payload(cfg: JobConfig, training_result: Dict[str, Any]) -> Dict[str, Any]:
@@ -65,99 +35,80 @@ def _build_worker_payload(cfg: JobConfig, training_result: Dict[str, Any]) -> Di
     }
 
 
-def _build_eval_attempts(cfg: JobConfig) -> List[Dict[str, int | float]]:
-    base_util = float(cfg.evaluation.gpu_memory_utilization or 0.9)
-    base_seqs = int(cfg.evaluation.max_num_seqs or max(1, min(cfg.evaluation.batch_size, 8)))
-    base_tokens = int(cfg.evaluation.max_num_batched_tokens or 8192)
+def _cleanup_runtime(stage: str) -> None:
+    import gc
+    import time
 
-    raw_attempts = [
-        {
-            "gpu_memory_utilization": base_util,
-            "max_num_seqs": base_seqs,
-            "max_num_batched_tokens": base_tokens,
-        },
-        {
-            "gpu_memory_utilization": min(base_util, 0.85),
-            "max_num_seqs": max(1, min(base_seqs, max(1, base_seqs // 2))),
-            "max_num_batched_tokens": max(1024, min(base_tokens, max(1024, base_tokens // 2))),
-        },
-        {
-            "gpu_memory_utilization": min(base_util, 0.80),
-            "max_num_seqs": max(1, min(base_seqs, max(1, base_seqs // 2))),
-            "max_num_batched_tokens": max(1024, min(base_tokens, max(1024, base_tokens // 4))),
-        },
-        {
-            "gpu_memory_utilization": min(base_util, 0.75),
-            "max_num_seqs": max(1, min(base_seqs, 2)),
-            "max_num_batched_tokens": max(1024, min(base_tokens, 2048)),
-        },
-        {
-            "gpu_memory_utilization": min(base_util, 0.70),
-            "max_num_seqs": 1,
-            "max_num_batched_tokens": 1024,
-        },
-    ]
+    logger.info("==> cleaning runtime after %s", stage)
 
-    result: List[Dict[str, int | float]] = []
-    seen = set()
-    for attempt in raw_attempts:
-        key = (
-            round(float(attempt["gpu_memory_utilization"]), 4),
-            int(attempt["max_num_seqs"]),
-            int(attempt["max_num_batched_tokens"]),
-        )
-        if key in seen:
-            continue
-        seen.add(key)
-        result.append(attempt)
-    return result
+    try:
+        gc.collect()
+    except Exception:
+        pass
+
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+    except Exception:
+        pass
+
+    time.sleep(0.3)
 
 
-def _is_retryable_vllm_failure(stderr: str, stdout: str, response_payload: Optional[Dict[str, Any]] = None) -> bool:
-    text = "\n".join(
-        part for part in [
-            stderr or "",
-            stdout or "",
-            json.dumps(response_payload, ensure_ascii=False) if response_payload else "",
-        ] if part
-    ).lower()
-
-    retry_markers = [
-        "free memory on device",
-        "desired gpu memory utilization",
-        "cuda out of memory",
+def _is_retryable_vllm_error(stderr: str) -> bool:
+    text = (stderr or "").lower()
+    markers = [
+        "free memory on device cuda",
+        "decrease gpu memory utilization",
         "engine core initialization failed",
-        "outofmemoryerror",
-        "nccl",
+        "cuda out of memory",
+        "out of memory",
     ]
-    return any(marker in text for marker in retry_markers)
+    return any(marker in text for marker in markers)
 
 
-def _run_worker_once(
-    request_path: Path,
-    response_path: Path,
-) -> subprocess.CompletedProcess[str]:
-    cmd = [
-        VLLM_PYTHON_BIN,
-        _worker_script_path(),
-        "--request",
-        str(request_path),
-        "--response",
-        str(response_path),
+def _attempt_overrides(cfg: JobConfig) -> list[dict]:
+    base_max_len = cfg.evaluation.max_model_len or 1024
+
+    return [
+        {
+            "gpu_memory_utilization": 0.72,
+            "max_num_seqs": 2,
+            "max_num_batched_tokens": min(1024, base_max_len),
+            "max_model_len": min(base_max_len, 1024),
+            "batch_size": 2,
+        },
+        {
+            "gpu_memory_utilization": 0.68,
+            "max_num_seqs": 2,
+            "max_num_batched_tokens": min(768, base_max_len),
+            "max_model_len": min(base_max_len, 768),
+            "batch_size": 2,
+        },
+        {
+            "gpu_memory_utilization": 0.64,
+            "max_num_seqs": 1,
+            "max_num_batched_tokens": min(512, base_max_len),
+            "max_model_len": min(base_max_len, 512),
+            "batch_size": 1,
+        },
+        {
+            "gpu_memory_utilization": 0.58,
+            "max_num_seqs": 1,
+            "max_num_batched_tokens": min(384, base_max_len),
+            "max_model_len": min(base_max_len, 384),
+            "batch_size": 1,
+        },
+        {
+            "gpu_memory_utilization": 0.52,
+            "max_num_seqs": 1,
+            "max_num_batched_tokens": min(256, base_max_len),
+            "max_model_len": min(base_max_len, 256),
+            "batch_size": 1,
+        },
     ]
-
-    logger.info("==> starting evaluation worker: %s", " ".join(cmd))
-
-    env = os.environ.copy()
-    env["PYTHONUNBUFFERED"] = "1"
-
-    return subprocess.run(
-        cmd,
-        check=False,
-        text=True,
-        capture_output=True,
-        env=env,
-    )
 
 
 def run_evaluation(
@@ -178,9 +129,6 @@ def run_evaluation(
     request_path = output_dir / "worker-request.json"
     response_path = output_dir / "worker-response.json"
 
-    attempts = _build_eval_attempts(cfg)
-    last_error: Optional[str] = None
-
     if reporter:
         reporter.report_status(
             "running",
@@ -190,119 +138,106 @@ def run_evaluation(
             extra={
                 "engine": cfg.evaluation.engine,
                 "task": ds_cfg.task,
-                "batch_size": cfg.evaluation.batch_size,
-                "max_num_seqs": cfg.evaluation.max_num_seqs,
-                "max_num_batched_tokens": cfg.evaluation.max_num_batched_tokens,
-                "worker_python": VLLM_PYTHON_BIN,
-                "attempts": len(attempts),
             },
         )
 
-    for attempt_index, attempt in enumerate(attempts, start=1):
-        payload = copy.deepcopy(_build_worker_payload(cfg, training_result))
-        payload["evaluation"]["gpu_memory_utilization"] = float(attempt["gpu_memory_utilization"])
-        payload["evaluation"]["max_num_seqs"] = int(attempt["max_num_seqs"])
-        payload["evaluation"]["max_num_batched_tokens"] = int(attempt["max_num_batched_tokens"])
+    _cleanup_runtime("pre-evaluation")
 
-        if response_path.exists():
-            try:
-                response_path.unlink()
-            except Exception:
-                pass
+    attempts = _attempt_overrides(cfg)
+    last_error = None
 
+    for idx, override in enumerate(attempts, start=1):
+        _cleanup_runtime(f"pre-evaluation-attempt-{idx}")
+
+        eval_cfg = cfg.model_copy(deep=True)
+        eval_cfg.evaluation.gpu_memory_utilization = override["gpu_memory_utilization"]
+        eval_cfg.evaluation.max_num_seqs = override["max_num_seqs"]
+        eval_cfg.evaluation.max_num_batched_tokens = override["max_num_batched_tokens"]
+        eval_cfg.evaluation.max_model_len = override["max_model_len"]
+        eval_cfg.evaluation.batch_size = override["batch_size"]
+
+        payload = _build_worker_payload(eval_cfg, training_result)
         with request_path.open("w", encoding="utf-8") as f:
             json.dump(payload, f, indent=2, ensure_ascii=False)
 
-        _cleanup_runtime(f"pre-evaluation-attempt-{attempt_index}")
+        cmd = [
+            VLLM_PYTHON_BIN,
+            _worker_script_path(),
+            "--request",
+            str(request_path),
+            "--response",
+            str(response_path),
+        ]
 
         logger.info(
-            "==> evaluation attempt %s/%s: gpu_memory_utilization=%s max_num_seqs=%s max_num_batched_tokens=%s",
-            attempt_index,
+            "==> evaluation attempt %s/%s: gpu_memory_utilization=%s max_num_seqs=%s max_num_batched_tokens=%s max_model_len=%s",
+            idx,
             len(attempts),
-            payload["evaluation"]["gpu_memory_utilization"],
-            payload["evaluation"]["max_num_seqs"],
-            payload["evaluation"]["max_num_batched_tokens"],
+            override["gpu_memory_utilization"],
+            override["max_num_seqs"],
+            override["max_num_batched_tokens"],
+            override["max_model_len"],
         )
+        logger.info("==> starting evaluation worker: %s", " ".join(cmd))
 
         if reporter:
             reporter.report_status(
                 "running",
                 stage="evaluation",
-                progress=round(((attempt_index - 1) / max(1, len(attempts))) * 10 + 1, 2),
-                message="evaluation worker started",
-                extra={
-                    "attempt": attempt_index,
-                    "attempts_total": len(attempts),
-                    "engine": cfg.evaluation.engine,
-                    "worker_python": VLLM_PYTHON_BIN,
-                    "gpu_memory_utilization": payload["evaluation"]["gpu_memory_utilization"],
-                    "max_num_seqs": payload["evaluation"]["max_num_seqs"],
-                    "max_num_batched_tokens": payload["evaluation"]["max_num_batched_tokens"],
-                },
+                progress=1,
+                message=f"evaluation attempt {idx}/{len(attempts)}",
+                extra=override,
             )
 
-        process = _run_worker_once(
-            request_path=request_path,
-            response_path=response_path,
-        )
+        try:
+            process = subprocess.run(
+                cmd,
+                check=False,
+                text=True,
+                capture_output=True,
+            )
+        except FileNotFoundError as exc:
+            raise RuntimeError(
+                f"vLLM python interpreter not found: {VLLM_PYTHON_BIN}. "
+                "Make sure Docker image created /opt/vllm-venv."
+            ) from exc
 
         if process.stdout:
             logger.info("==> evaluation worker stdout:\n%s", process.stdout.strip())
         if process.stderr:
             logger.warning("==> evaluation worker stderr:\n%s", process.stderr.strip())
 
-        response_payload: Optional[Dict[str, Any]] = None
-        if response_path.exists():
-            try:
-                with response_path.open("r", encoding="utf-8") as f:
-                    loaded = json.load(f)
-                if isinstance(loaded, dict):
-                    response_payload = loaded
-            except Exception:
-                response_payload = None
+        _cleanup_runtime(f"post-evaluation-attempt-{idx}")
 
-        _cleanup_runtime(f"post-evaluation-attempt-{attempt_index}")
+        if process.returncode == 0 and response_path.exists():
+            with response_path.open("r", encoding="utf-8") as f:
+                result = json.load(f)
 
-        if process.returncode == 0 and isinstance(response_payload, dict) and response_payload.get("status") != "failed":
-            if reporter:
-                reporter.report_status(
-                    "running",
-                    stage="evaluation_completed",
-                    progress=100,
-                    message="evaluation completed",
-                    extra=response_payload.get("summary") or {},
-                )
-            return response_payload
+            if not isinstance(result, dict):
+                raise RuntimeError("Evaluation worker returned invalid response payload")
 
-        retryable = _is_retryable_vllm_failure(
-            stderr=process.stderr or "",
-            stdout=process.stdout or "",
-            response_payload=response_payload,
-        )
-
-        if isinstance(response_payload, dict) and response_payload.get("status") == "failed":
-            last_error = response_payload.get("error") or "Evaluation worker reported failure"
+            if result.get("status") == "failed":
+                last_error = result.get("error") or "Evaluation worker reported failure"
+            else:
+                if reporter:
+                    reporter.report_status(
+                        "running",
+                        stage="evaluation_completed",
+                        progress=100,
+                        message="evaluation completed",
+                        extra=result.get("summary") or {},
+                    )
+                return result
         else:
             last_error = (
-                "Evaluation worker failed with exit code "
-                f"{process.returncode}. stderr: {(process.stderr or '').strip() or '<empty>'}"
+                f"Evaluation worker failed with exit code {process.returncode}. "
+                f"stderr: {process.stderr.strip() or '<empty>'}"
             )
 
-        if retryable and attempt_index < len(attempts):
+        if idx < len(attempts) and _is_retryable_vllm_error(process.stderr):
             logger.warning("==> retryable vLLM failure detected, retrying with smaller memory settings")
-            if reporter:
-                reporter.report_progress(
-                    stage="evaluation",
-                    progress=round((attempt_index / max(1, len(attempts))) * 50, 2),
-                    message="retrying evaluation with lower vllm memory settings",
-                    extra={
-                        "attempt": attempt_index,
-                        "attempts_total": len(attempts),
-                        "error": last_error,
-                    },
-                )
             continue
 
-        raise RuntimeError(last_error or "Evaluation worker failed")
+        break
 
-    raise RuntimeError(last_error or "Evaluation worker failed")
+    raise RuntimeError(last_error or "Evaluation failed after all retry attempts")

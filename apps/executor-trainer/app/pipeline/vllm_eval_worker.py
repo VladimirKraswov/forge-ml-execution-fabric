@@ -464,7 +464,6 @@ def _build_vllm_runtime(payload: Dict[str, Any]):
         "gpu_memory_utilization": float(eval_cfg.get("gpu_memory_utilization", 0.9)),
         "trust_remote_code": bool(model_cfg.get("trust_remote_code", False)),
         "enforce_eager": bool(eval_cfg.get("enforce_eager", False)),
-        "disable_log_stats": True,
     }
 
     if eval_cfg.get("max_num_seqs"):
@@ -473,14 +472,15 @@ def _build_vllm_runtime(payload: Dict[str, Any]):
     if eval_cfg.get("max_num_batched_tokens"):
         engine_args["max_num_batched_tokens"] = int(eval_cfg["max_num_batched_tokens"])
 
+    if eval_cfg.get("max_model_len"):
+        engine_args["max_model_len"] = int(eval_cfg["max_model_len"])
+
     lora_request = None
 
     if resolved_target == "merged":
         merged_dir = training_result.get("merged_dir")
         if not merged_dir or not Path(merged_dir).exists():
             raise ValueError("Merged model directory is missing, but evaluation.target='merged'")
-
-        _sanitize_tokenizer_config(str(merged_dir))
 
         model_label = str(merged_dir)
         llm = LLM(model=merged_dir, **engine_args)
@@ -493,9 +493,6 @@ def _build_vllm_runtime(payload: Dict[str, Any]):
     lora_dir = training_result.get("lora_dir")
     if not lora_dir or not Path(lora_dir).exists():
         raise ValueError("LoRA adapter directory is missing, but evaluation.target='lora'")
-
-    if Path(str(base_model)).exists():
-        _sanitize_tokenizer_config(str(base_model))
 
     engine_args["enable_lora"] = True
     engine_args["max_loras"] = 1
