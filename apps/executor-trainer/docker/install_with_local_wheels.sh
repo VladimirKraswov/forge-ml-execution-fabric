@@ -20,55 +20,77 @@ fi
 
 mkdir -p "${WHEEL_DIR}"
 
+echo "==> wheel dir: ${WHEEL_DIR}"
+find "${WHEEL_DIR}" -maxdepth 1 -type f -name '*.whl' | sort || true
+
 find_local_wheels() {
   "${PYTHON_BIN}" - "$MODE" "$TARGET" "$WHEEL_DIR" <<'PY'
 import glob
 import json
 import os
+import re
 import sys
 
 mode = sys.argv[1]
 target = sys.argv[2]
 wheel_dir = sys.argv[3]
 
-try:
-    from packaging.requirements import Requirement
-    from packaging.utils import canonicalize_name, parse_wheel_filename
-except Exception:
-    print("[]")
-    raise SystemExit(0)
+def normalize_name(name: str) -> str:
+    return re.sub(r"[-_.]+", "-", name).lower()
 
-def extract_req_names_from_file(path: str):
-    names = []
-    with open(path, "r", encoding="utf-8") as f:
-        for raw_line in f:
-            line = raw_line.strip()
-            if not line or line.startswith("#"):
-                continue
-            if line.startswith("-r ") or line.startswith("--requirement "):
-                continue
-            if line.startswith("--"):
-                continue
-            if "://" in line:
-                continue
-            if line.startswith(".") or line.startswith("/"):
-                continue
-            try:
-                req = Requirement(line)
-            except Exception:
-                continue
-            names.append(canonicalize_name(req.name))
-    return names
+def wheel_name_from_filename(path: str):
+    base = os.path.basename(path)
+    if not base.endswith(".whl"):
+        return None
+    # wheel format: {dist}-{version}(-{build})?-{py}-{abi}-{platform}.whl
+    parts = base[:-4].split("-")
+    if len(parts) < 5:
+        return None
+    return normalize_name(parts[0])
+
+def parse_req_name(line: str):
+    line = line.strip()
+    if not line or line.startswith("#"):
+        return None
+    if line.startswith("-r ") or line.startswith("--requirement "):
+        return None
+    if line.startswith("--"):
+        return None
+    if "://" in line:
+        return None
+    if line.startswith(".") or line.startswith("/"):
+        return None
+
+    # remove env markers
+    line = line.split(";", 1)[0].strip()
+
+    for sep in ["==", ">=", "<=", "~=", "!=", ">", "<"]:
+        if sep in line:
+            line = line.split(sep, 1)[0].strip()
+            break
+
+    if "[" in line:
+        line = line.split("[", 1)[0].strip()
+
+    if not line:
+        return None
+
+    return normalize_name(line)
 
 def extract_req_names(mode_value: str, target_value: str):
     if mode_value == "--requirements":
-        return extract_req_names_from_file(target_value)
+        names = []
+        with open(target_value, "r", encoding="utf-8") as f:
+            for raw_line in f:
+                name = parse_req_name(raw_line)
+                if name:
+                    names.append(name)
+        return names
+
     if mode_value == "--package":
-        try:
-            req = Requirement(target_value)
-            return [canonicalize_name(req.name)]
-        except Exception:
-            return []
+        name = parse_req_name(target_value)
+        return [name] if name else []
+
     return []
 
 req_names = set(extract_req_names(mode, target))
@@ -78,12 +100,8 @@ if not req_names:
 
 matched = []
 for wheel_path in sorted(glob.glob(os.path.join(wheel_dir, "*.whl"))):
-    try:
-        name, version, build, tags = parse_wheel_filename(os.path.basename(wheel_path))
-        norm_name = canonicalize_name(name)
-    except Exception:
-        continue
-    if norm_name in req_names:
+    wheel_name = wheel_name_from_filename(wheel_path)
+    if wheel_name and wheel_name in req_names:
         matched.append(os.path.abspath(wheel_path))
 
 print(json.dumps(matched, ensure_ascii=False))
@@ -95,35 +113,36 @@ LOCAL_WHEELS=$("${PYTHON_BIN}" - <<'PY' "$LOCAL_WHEELS_JSON"
 import json
 import sys
 
-items = json.loads(sys.argv[1])
-for item in items:
+for item in json.loads(sys.argv[1]):
     print(item)
 PY
 )
 
 if [ -n "${LOCAL_WHEELS}" ]; then
-  echo "==> installing local wheels first from ${WHEEL_DIR}"
+  echo "==> installing matching local wheels first"
   while IFS= read -r wheel_path; do
     [ -z "${wheel_path}" ] && continue
     echo "==> local wheel: ${wheel_path}"
     "${PYTHON_BIN}" -m pip install \
-      --find-links "${WHEEL_DIR}" \
+      --no-index \
       "${wheel_path}" \
       --break-system-packages
   done <<< "${LOCAL_WHEELS}"
 else
-  echo "==> no matching local wheels found in ${WHEEL_DIR}"
+  echo "==> no matching top-level local wheels found"
 fi
 
 if [ "${MODE}" = "--requirements" ]; then
-  echo "==> installing requirements from ${TARGET} with local wheel fallback"
+  echo "==> installing requirements with local-wheel preference"
   "${PYTHON_BIN}" -m pip install \
+    --prefer-binary \
     --find-links "${WHEEL_DIR}" \
     -r "${TARGET}" \
     --break-system-packages
 elif [ "${MODE}" = "--package" ]; then
-  echo "==> installing package ${TARGET} with local wheel fallback"
+  echo "==> installing package ${TARGET} with local-wheel preference"
   "${PYTHON_BIN}" -m pip install \
+    --prefer-binary \
     --find-links "${WHEEL_DIR}" \
     "${TARGET}" \
     --break-system-packages

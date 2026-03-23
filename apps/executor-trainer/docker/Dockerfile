@@ -30,7 +30,9 @@ COPY packages /trainer/packages
 COPY docker/install_with_local_wheels.sh /trainer/install_with_local_wheels.sh
 
 RUN chmod +x /trainer/install_with_local_wheels.sh && \
-    mkdir -p /trainer/packages/pip
+    mkdir -p /trainer/packages/pip && \
+    echo "==> copied local wheels:" && \
+    find /trainer/packages/pip -maxdepth 1 -type f -name '*.whl' | sort | head -200
 
 # train env
 RUN python3 -m venv /opt/venv
@@ -40,9 +42,6 @@ RUN /trainer/install_with_local_wheels.sh /opt/venv/bin/python --requirements /t
 # separate vLLM env
 RUN python3 -m venv /opt/vllm-venv
 RUN /opt/vllm-venv/bin/pip install -U pip setuptools wheel
-
-# If vllm wheel exists in ./packages/pip it will be used first.
-# Missing deps will be resolved from local wheels too, and only then from network.
 RUN /trainer/install_with_local_wheels.sh /opt/vllm-venv/bin/python --package vllm /trainer/packages/pip
 
 COPY app /trainer/app
