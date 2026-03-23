@@ -736,6 +736,32 @@ def run_worker(request: Dict[str, Any]) -> Dict[str, Any]:
     return result_payload
 
 
+def _cleanup_worker_runtime() -> None:
+    try:
+        import gc
+        gc.collect()
+    except Exception:
+        pass
+
+    try:
+        import torch
+        if torch.cuda.is_available():
+            try:
+                torch.cuda.synchronize()
+            except Exception:
+                pass
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+            try:
+                torch.cuda.ipc_collect()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--request", required=True)
@@ -764,6 +790,8 @@ def main() -> None:
             json.dump(error_payload, f, indent=2, ensure_ascii=False)
         print(error_payload["traceback"], file=sys.stderr)
         sys.exit(1)
+    finally:
+        _cleanup_worker_runtime()
 
 
 if __name__ == "__main__":
