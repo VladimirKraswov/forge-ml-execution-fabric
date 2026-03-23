@@ -26,6 +26,7 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /trainer
 
 COPY requirements.txt /trainer/requirements.txt
+COPY requirements.vllm.txt /trainer/requirements.vllm.txt
 COPY packages /trainer/packages
 COPY docker/install_with_local_wheels.sh /trainer/install_with_local_wheels.sh
 
@@ -42,7 +43,7 @@ RUN /trainer/install_with_local_wheels.sh /opt/venv/bin/python --requirements /t
 # separate vLLM env
 RUN python3 -m venv /opt/vllm-venv
 RUN /opt/vllm-venv/bin/pip install -U pip setuptools wheel
-RUN /trainer/install_with_local_wheels.sh /opt/vllm-venv/bin/python --package vllm /trainer/packages/pip
+RUN /trainer/install_with_local_wheels.sh /opt/vllm-venv/bin/python --requirements /trainer/requirements.vllm.txt /trainer/packages/pip
 
 COPY app /trainer/app
 COPY docker/entrypoint.sh /trainer/entrypoint.sh
