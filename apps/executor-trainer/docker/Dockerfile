@@ -23,15 +23,23 @@ RUN apt-get update && apt-get install -y \
     libstdc++6 \
     && rm -rf /var/lib/apt/lists/*
 
-RUN python3 -m venv /opt/venv
-
 WORKDIR /trainer
 
-# Устанавливаем зависимости из requirements.txt
 COPY requirements.txt /trainer/requirements.txt
 
-RUN pip install -U pip setuptools wheel
-RUN pip install -r /trainer/requirements.txt --break-system-packages
+# train env
+RUN python3 -m venv /opt/venv
+RUN /opt/venv/bin/pip install -U pip setuptools wheel
+RUN /opt/venv/bin/pip install -r /trainer/requirements.txt --break-system-packages
+
+# separate vLLM env
+RUN python3 -m venv /opt/vllm-venv
+RUN /opt/vllm-venv/bin/pip install -U pip setuptools wheel uv
+
+# Let uv choose matching torch backend automatically for the machine/driver.
+RUN UV_TORCH_BACKEND=auto /opt/vllm-venv/bin/uv pip install \
+    --python /opt/vllm-venv/bin/python \
+    vllm
 
 COPY app /trainer/app
 COPY docker/entrypoint.sh /trainer/entrypoint.sh
