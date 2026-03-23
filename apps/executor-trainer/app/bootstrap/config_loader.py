@@ -1,11 +1,40 @@
+from __future__ import annotations
+
 import copy
 import json
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 import requests
 
 from ..bootstrap.schemas import JobConfig
+
+
+def _read_raw_config(path: str) -> Any:
+    if path.startswith("http://") or path.startswith("https://"):
+        print(f"==> loading remote config from {path}")
+        response = requests.get(path, timeout=30)
+        response.raise_for_status()
+        return response.json()
+
+    config_path = Path(path)
+    if not config_path.exists():
+        raise FileNotFoundError(f"Config not found: {path}")
+
+    with config_path.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _deep_merge(base: Any, override: Any) -> Any:
+    if isinstance(base, dict) and isinstance(override, dict):
+        merged = copy.deepcopy(base)
+        for key, value in override.items():
+            if key in merged:
+                merged[key] = _deep_merge(merged[key], value)
+            else:
+                merged[key] = copy.deepcopy(value)
+        return merged
+    return copy.deepcopy(override)
 
 
 def _migrate_legacy_config(raw: Dict[str, Any], source_ref: str) -> Dict[str, Any]:
@@ -70,18 +99,33 @@ def _migrate_legacy_config(raw: Dict[str, Any], source_ref: str) -> Dict[str, An
 
 
 def load_config(path: str) -> JobConfig:
-    if path.startswith("http://") or path.startswith("https://"):
-        print(f"==> loading remote config from {path}")
-        response = requests.get(path, timeout=30)
-        response.raise_for_status()
-        raw = response.json()
-    else:
-        config_path = Path(path)
-        if not config_path.exists():
-            raise FileNotFoundError(f"Config not found: {path}")
-
-        with config_path.open("r", encoding="utf-8") as f:
-            raw = json.load(f)
-
+    raw = _read_raw_config(path)
     migrated = _migrate_legacy_config(raw, path)
     return JobConfig.model_validate(migrated)
+
+
+def load_config_bundle(path: str) -> List[JobConfig]:
+    raw = _read_raw_config(path)
+
+    if isinstance(raw, dict) and isinstance(raw.get("jobs"), list):
+        defaults = raw.get("defaults") or {}
+        jobs = raw.get("jobs") or []
+
+        if not jobs:
+            raise ValueError("Config bundle contains empty 'jobs' list")
+
+        result: List[JobConfig] = []
+        for idx, job_raw in enumerate(jobs, start=1):
+            if not isinstance(job_raw, dict):
+                raise ValueError(f"Job #{idx} in bundle must be an object")
+
+            merged = _deep_merge(defaults, job_raw)
+            migrated = _migrate_legacy_config(merged, path)
+            result.append(JobConfig.model_validate(migrated))
+        return result
+
+    if not isinstance(raw, dict):
+        raise ValueError("Config must be a JSON object or a bundle with 'jobs'")
+
+    migrated = _migrate_legacy_config(raw, path)
+    return [JobConfig.model_validate(migrated)]
