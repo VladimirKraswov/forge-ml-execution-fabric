@@ -5,6 +5,7 @@
 !app/**
 !docker/**
 !requirements.txt
+!requirements.vllm.txt
 !README.md
 !examples/**
 !.env.local.example
